@@ -1,6 +1,6 @@
 {
   "name": "dsh-fleet",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Multi-device fleet for DeepSeek Harness: steward sessions, peer heartbeat/roster, and A2A message delivery over the tailnet",
   "type": "module",
   "main": "lib/index.js",
@@ -15,7 +15,9 @@
     "lib/index.js",
     "lib/client.js",
     "cordis.patch.yml",
-    "README.md"
+    "skills/fleet-ops/SKILL.md",
+    "README.md",
+    "LICENSE"
   ],
   "keywords": [
     "dsh-plugin",

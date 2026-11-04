@@ -5,13 +5,16 @@ DeepSeek Harness 多设备舰队插件：每台设备常驻一个「管家」age
 ## 能力
 
 - **管家会话**：首次消息自动创建/恢复（durable session），可指定 agent preset 与工作目录
-- **`POST /fleet/message`**（A2A 入口）：把一条消息投进本机管家的回合，可同步等待完整回复（默认）或异步投递；并发请求返回 409
-- **`GET /fleet/status`**：心跳——设备名、版本、uptime、管家 live/status/busy
-- **`GET /fleet/roster`**：本机视角的舰队名册（自己 + 各对端缓存状态）
-- **工具 `fleet_send` / `fleet_status`**：本机任意 agent 可用，向对端管家发任务/查舰队状态
-- **心跳轮询**：按间隔探测各对端 `/fleet/status`，缓存在线状态
+- **`POST /fleet/message`**（A2A 入口）：把一条消息投进本机管家的回合。**v0.3 起默认异步**——立即返回 `deliveryId`，管家干完后把回执推回发送方（push）；发送方不可达时回执保留在本机，由发送方 `GET /fleet/replies` 拉取（pull）。`wait:true` 仍同步长轮询。`type:"receipt"` 的 POST 是对端回执推送入口
+- **回执收件箱**：`fleet_inbox` 工具查看/拉取回执（任务结果、进度、错误）；长任务超过 `progressAfterSec` 会先推一条「仍在处理」
+- **`GET /fleet/status`**：心跳——设备名、版本、uptime、管家 live/status/busy、**会话活跃度**（本机任意 session 的近期事件，GUI 对话也算——面板不再把正干活的设备显示成休眠）
+- **`GET/POST /fleet/roster`**：名册查询 + **运行时增删成员**（add 前先探测对端身份，通过后持久化回 fleet.json）
+- **`GET /fleet/replies`**：拉取本机保留的未送达回执（pull 兜底）
+- **工具 `fleet_send` / `fleet_status` / `fleet_inbox` / `fleet_member_add` / `fleet_member_remove`**：本机任意 agent 可用
+- **心跳轮询**：探测各对端 `/fleet/status`；顺带重试回执推送、发长任务进度条
+- **Web GUI 舰队面板**：侧边栏「舰队」图标，设备卡片（在线/版本/uptime/管家/会话/心跳）
 
-所有 `/fleet/*` 请求须带 `Authorization: Bearer <secret>`（舰队共享密钥）。
+所有 `/fleet/*` 请求（`/fleet/panel` 只读端点除外）须带 `Authorization: Bearer <secret>`（舰队共享密钥）。
 
 ## 安装（每台设备）
 
@@ -33,9 +36,14 @@ dsh plugin --profile web add github:<you>/dsh-fleet   # 或本地路径
     { "device": "pc",  "baseUrl": "http://100.64.0.3:43129", "role": "PC 管家，Windows" },
     { "device": "mac", "baseUrl": "http://100.64.0.4:43129", "role": "MacBook 管家，开发机" }
   ],
-  "heartbeatSec": 30
+  "heartbeatSec": 30,
+  "advertise": { "baseUrl": "http://100.64.0.1:43129" },
+  "progressAfterSec": 300
 }
 ```
+
+- `advertise.baseUrl`：本机**对外可达**的根地址。配置后异步回执由对端主动推回（push）；留空则只能等发送方来拉（pull）——例如 DSH Desktop 默认只监听 127.0.0.1，就选 pull。
+- `progressAfterSec`：管家单条投递超过该秒数未完成，向发送方推一条进度回执（默认 300）。
 
 也可以走 profile 的 `cordis.patch.yml`（id 定位 + config 覆写），两种方式文件值优先。
 
@@ -60,6 +68,43 @@ curl -X POST http://127.0.0.1:43129/fleet/message \
 ```
 
 对端 A 调本机 B 的 `/fleet/message` 即是 A2A；本机任意 agent 也可以直接用 `fleet_send` 工具指挥对端管家。
+
+## 成员管理（v0.3）
+
+不再手改 fleet.json 也能增删成员。三种等价入口：
+
+```sh
+# 1) HTTP API（脚本/CLI 友好）
+curl -X POST http://100.64.0.1:43129/fleet/roster \
+  -H "Authorization: Bearer <secret>" -H "content-type: application/json" \
+  -d '{"op":"add","device":"pc","baseUrl":"http://100.64.0.3:43129","role":"PC 管家"}'
+#   → {"ok":true,"added":"pc","peers":[...]}   add 前会探测对端 /fleet/status 验证设备名与密钥
+curl -X POST .../fleet/roster -d '{"op":"remove","device":"pc"}'
+
+# 2) 工具（给 AI 用）：fleet_member_add / fleet_member_remove
+
+# 3) 直接编辑 fleet.json 后重启该设备
+```
+
+**新成员入网流程**：① 新设备装好本插件 + fleet.json（device/secret/steward/peers 先指向任一现有成员）→ ② 在现有成员上 `fleet_member_add`（或 curl add；若双方都要主动联系对方，新设备也执行一次 add 指回，或 add 时 `announce:true` 自动反向注册——需要本机配置 `advertise.baseUrl`）。密钥是全舰队共享的，改密钥=全量轮换。
+
+## 异步回执协议（v0.3）
+
+`fleet_send` 默认不再阻塞等待：
+
+1. 发送方 POST `{text, deliveryId, callback:{device,baseUrl}?}`（无 callback = 纯 pull 模式），立即拿 `{"ok":true,"async":true,"deliveryId":"d-xxxxxxxx"}`
+2. 对端管家跑完任务，回执（reply/progress/error）入本机待发队列：
+   - 发送方给了 callback → 立即 POST 回对端 `/fleet/message` `{"type":"receipt",...}`，失败由心跳每轮重试（最多 3 次），仍失败转 pull
+   - 发送方用 `fleet_inbox` 工具收（会自动先拉一遍指定对端的 `/fleet/replies` 再展示未读）
+3. 给 AI 的推荐姿势：`fleet_send` 异步派活 → `schedule_create` 设个到点提醒 → 提醒触发时 `fleet_inbox` 收结果汇报给用户
+4. 回执/外发账本落盘在同目录：`fleet-outbox.json` / `fleet-inbox.json` / `fleet-replies.json`（环形上限 100/200/200 条）
+
+注意：同步模式（`wait:true`）同一时刻只接受一条在途请求（409），异步模式可排队（followup 天然排队）；多条排队时回复归属按 seq 区间近似划分。
+
+## fleet-ops 技能
+
+仓库内 `skills/fleet-ops/SKILL.md` 是给管家/agent 的操作手册（增删成员、异步派活收回执、排障），
+安装到本机 skills 目录即被热加载：`cp -r skills/fleet-ops ~/.dsh/skills/`（或 `$DSH_HOME/skills/`）。
 
 ## 设计说明
 
