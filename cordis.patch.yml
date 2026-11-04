@@ -1,0 +1,6 @@
+# dsh-fleet loader patch: pure insert only (desktop hot-mount requirement).
+# Service injection comes from lib/index.js's exported `inject` array;
+# config (device/secret/peers/...) comes from fleet.json, not from this patch.
+- insert:
+    - id: dsh-fleet
+      name: dsh-fleet
