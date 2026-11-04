@@ -13,6 +13,8 @@ DeepSeek Harness 多设备舰队插件：每台设备常驻一个「管家」age
 - **工具 `fleet_send` / `fleet_status` / `fleet_inbox` / `fleet_member_add` / `fleet_member_remove`**：本机任意 agent 可用
 - **心跳轮询**：探测各对端 `/fleet/status`；顺带重试回执推送、发长任务进度条
 - **Web GUI 舰队面板**：侧边栏「舰队」图标，设备卡片（在线/版本/uptime/管家/会话/心跳）
+- **面板管理（v0.3.1）**：面板右上角「＋ 添加设备」按钮（填设备名/地址/职责，服务端先探测验证身份再入册）、对端卡片 ✕ 移除按钮。走 `POST /fleet/panel/action`，鉴权用浏览器 GUI 会话 cookie（host 侧 connection 服务验证）或 Bearer，secret 不进浏览器
+- **CLI（v0.3.1）**：`bin/dsh-fleet.js`，零依赖 node 18+：`status` / `roster` / `add <device> <baseUrl> [--role R] [--announce --my-url URL]` / `remove <device>` / `send <device> <text> [--wait --timeout N]` / `inbox <device>`；全局 `--api URL` `--secret S` `--json`。默认从本地 fleet.json 取 secret/api
 
 所有 `/fleet/*` 请求（`/fleet/panel` 只读端点除外）须带 `Authorization: Bearer <secret>`（舰队共享密钥）。
 
@@ -70,6 +72,15 @@ curl -X POST http://127.0.0.1:43129/fleet/message \
 对端 A 调本机 B 的 `/fleet/message` 即是 A2A；本机任意 agent 也可以直接用 `fleet_send` 工具指挥对端管家。
 
 ## 成员管理（v0.3）
+
+三入口 + 面板按钮（v0.3.1）：
+
+1. **AI 工具**：`fleet_member_add`（`device`/`baseUrl`/`role?`/`announce?`，announce=true 且本机配了 `advertise.baseUrl` 时双向互注）/ `fleet_member_remove`
+2. **HTTP API**：`POST /fleet/roster {"op":"add","device":"pc","baseUrl":"http://…","role":"…"}` / `{"op":"remove","device":"pc"}`；`POST /fleet/panel/action` 同参（GUI cookie 或 Bearer）
+3. **CLI**：`node bin/dsh-fleet.js add pc http://100.73.42.122:43129 --role "PC 管家"`（先探测对端 `/fleet/status` 验证 device 名+secret，防冒名；`--announce --my-url http://…` 让对端把本机也加进去）
+4. **fleet-ops 技能**：给管家/AI 的操作手册（见下）
+
+add 一律先探测对端身份（自称的 device 名必须与探测结果一致），通过才入册并持久化回 fleet.json。
 
 不再手改 fleet.json 也能增删成员。三种等价入口：
 
