@@ -1,6 +1,6 @@
 {
   "name": "dsh-fleet",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Multi-device fleet for DeepSeek Harness: steward sessions, peer heartbeat/roster, and A2A message delivery over the tailnet",
   "type": "module",
   "main": "lib/index.js",
@@ -13,6 +13,9 @@
       "default": "./lib/client.js"
     },
     "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
   },
   "files": [
     "lib/index.js",

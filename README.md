@@ -9,12 +9,12 @@ DeepSeek Harness 多设备舰队插件：每台设备常驻一个「管家」age
 - **回执收件箱**：`fleet_inbox` 工具查看/拉取回执（任务结果、进度、错误）；长任务超过 `progressAfterSec` 会先推一条「仍在处理」
 - **`GET /fleet/status`**：心跳——设备名、版本、uptime、管家 live/status/busy、**会话活跃度**（本机任意 session 的近期事件，GUI 对话也算——面板不再把正干活的设备显示成休眠）
 - **`GET/POST /fleet/roster`**：名册查询 + **运行时增删成员**（add 前先探测对端身份，通过后持久化回 fleet.json）
-- **`GET /fleet/replies`**：拉取本机保留的未送达回执（pull 兜底）
+- **`GET /fleet/replies?for=<device>`**：拉取本机替 `<device>` 保留的未送达回执（pull 兜底），读取不消费；`POST /fleet/replies {for, keys}` 确认后才标记已送达（v0.3.2）
 - **工具 `fleet_send` / `fleet_status` / `fleet_inbox` / `fleet_member_add` / `fleet_member_remove`**：本机任意 agent 可用
 - **心跳轮询**：探测各对端 `/fleet/status`；顺带重试回执推送、发长任务进度条
 - **Web GUI 舰队面板**：侧边栏「舰队」图标，设备卡片（在线/版本/uptime/管家/会话/心跳）
 - **面板管理（v0.3.1）**：面板右上角「＋ 添加设备」按钮（填设备名/地址/职责，服务端先探测验证身份再入册）、对端卡片 ✕ 移除按钮。走 `POST /fleet/panel/action`，鉴权用浏览器 GUI 会话 cookie（host 侧 connection 服务验证）或 Bearer，secret 不进浏览器
-- **CLI（v0.3.1）**：`bin/dsh-fleet.js`，零依赖 node 18+：`status` / `roster` / `add <device> <baseUrl> [--role R] [--announce --my-url URL]` / `remove <device>` / `send <device> <text> [--wait --timeout N]` / `inbox <device>`；全局 `--api URL` `--secret S` `--json`。默认从本地 fleet.json 取 secret/api
+- **CLI（v0.3.1）**：`bin/dsh-fleet.js`，零依赖 node 18+：`status` / `roster` / `add <device> <baseUrl> [--role R] [--announce --my-url URL]` / `remove <device>` / `send <device> <text> [--wait --timeout N]` / `inbox <device>`；全局 `--api URL` `--secret S` `--as NAME` `--json`。默认从本地 fleet.json 取 secret/api/device。`send` 直接投给 `<device>`（v0.3.2 前会误投本机管家）；`inbox` 拉到的回执转存进本机收件箱后再向对端确认
 
 所有 `/fleet/*` 请求（`/fleet/panel` 只读端点除外）须带 `Authorization: Bearer <secret>`（舰队共享密钥）。
 
@@ -103,14 +103,21 @@ curl -X POST .../fleet/roster -d '{"op":"remove","device":"pc"}'
 
 `fleet_send` 默认不再阻塞等待：
 
-1. 发送方 POST `{text, deliveryId, callback:{device,baseUrl}?}`（无 callback = 纯 pull 模式），立即拿 `{"ok":true,"async":true,"deliveryId":"d-xxxxxxxx"}`
-2. 对端管家跑完任务，回执（reply/progress/error）入本机待发队列：
-   - 发送方给了 callback → 立即 POST 回对端 `/fleet/message` `{"type":"receipt",...}`，失败由心跳每轮重试（最多 3 次），仍失败转 pull
-   - 发送方用 `fleet_inbox` 工具收（会自动先拉一遍指定对端的 `/fleet/replies` 再展示未读）
+1. 发送方 POST `{text, deliveryId, from, callback:{device,baseUrl}?}`（`from` = 发送方设备名，回执按它归属；无 callback = 纯 pull 模式），立即拿 `{"ok":true,"async":true,"deliveryId":"d-xxxxxxxx"}`
+2. 对端管家跑完任务，回执（reply/progress/error）入本机待发队列，每条回执有 `key = deliveryId:kind`：
+   - 发送方给了 callback → 立即 POST 回对端 `/fleet/message` `{"type":"receipt",key,...}`，失败由心跳每轮重试（最多 3 次），仍失败转 pull
+   - 发送方用 `fleet_inbox` 工具收：`GET /fleet/replies?for=<本机>` 只拿发给自己的回执 → 存入本机收件箱 → `POST /fleet/replies {for, keys}` 确认，对端这才标记已送达。中途断网不丢，下次重拉；收件箱按 `from+key` 去重，推送重试和 pull 重叠也不会重复
+   - 兼容：不带 `for` 的 GET（v0.3.1 及以前的发送方）仍是旧行为——返回全部未送达回执并在读取时消费。新版发送方遇到旧版对端时不发确认。**多于两台设备的舰队请全部升级到 v0.3.2**，否则旧版发送方的 pull 仍会拿走别人的回执
 3. 给 AI 的推荐姿势：`fleet_send` 异步派活 → `schedule_create` 设个到点提醒 → 提醒触发时 `fleet_inbox` 收结果汇报给用户
 4. 回执/外发账本落盘在同目录：`fleet-outbox.json` / `fleet-inbox.json` / `fleet-replies.json`（环形上限 100/200/200 条）
 
 注意：同步模式（`wait:true`）同一时刻只接受一条在途请求（409），异步模式可排队（followup 天然排队）；多条排队时回复归属按 seq 区间近似划分。
+
+## 测试
+
+```sh
+npm test   # node --test，进程内起多个实例 + 假管家，覆盖回执归属/确认/去重与 CLI 路由
+```
 
 ## fleet-ops 技能
 

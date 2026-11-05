@@ -32,6 +32,6 @@ description: 舰队运维操作手册：添加/移除成员、异步派活与收
 
 - 401 unauthorized：secret 不一致——密钥是全舰队共享的，轮换要全量同步
 - 探测失败/心跳离线：查对端 dsh 是否在跑、baseUrl 是否对外可达（tailscale IP）、端口
-- 回执一直不来：对端可能忙/挂了；`fleet_status` 看对端管家 busy；再 `fleet_inbox {device}` 主动拉
+- 回执一直不来：对端可能忙/挂了；`fleet_status` 看对端管家 busy；再 `fleet_inbox {device}` 主动拉（只拉发给本机的回执，确认后对端才删除；拉取结果提示「旧版协议」说明对端未升级到 v0.3.2）
 - 桌面版（只监听 127.0.0.1）收不到推送回执属正常——它只能 pull；给常驻设备配 advertise.baseUrl 启用推送
 - 回执账本在 fleet.json 同目录：fleet-outbox.json（外发）/ fleet-inbox.json（收件）/ fleet-replies.json（待发）

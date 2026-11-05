@@ -23,6 +23,7 @@
  *   --json          raw JSON output
  */
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -37,14 +38,16 @@ const USAGE = `dsh-fleet — 多设备舰队管理 CLI
       --announce                  同时让对方把本机加入它的名册（双向互注）
       --my-url URL                announce 时本机对外的 baseUrl（默认读本地 fleet.json 的 advertise.baseUrl）
   remove <device>                 移除成员
-  send <device> <text>            给对方管家派活（默认异步，返回 deliveryId）
+  send <device> <text>            直接给 <device> 的管家派活（默认异步，返回 deliveryId）
       --wait                      同步等待回复
       --timeout SEC               --wait 的上限（默认 300）
-  inbox <device>                拉取该成员替你保留的未送达回执
+  inbox <device>                  拉取 <device> 替本机保留的未送达回执，
+                                  转存进本机（--api 所指成员）收件箱后再向对端确认
 
 全局:
-  --api URL     目标成员地址（默认 $DSH_FLEET_API 或本地 fleet.json advertise.baseUrl 或 http://127.0.0.1:43129）
+  --api URL     本机成员地址（默认 $DSH_FLEET_API 或本地 fleet.json advertise.baseUrl 或 http://127.0.0.1:43129）
   --secret TEXT 舰队密钥（默认读本地 fleet.json）
+  --as NAME     以哪台设备的身份收发回执（默认本地 fleet.json 的 device）
   --json        原始 JSON 输出
   --version     版本
 `;
@@ -66,7 +69,7 @@ function parseArgs(argv) {
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === "--json" || a === "--wait" || a === "--announce" || a === "--keep-unread") { out.flags[a.slice(2)] = true; continue; }
-		if (a === "--api" || a === "--secret" || a === "--role" || a === "--timeout" || a === "--my-url") {
+		if (a === "--api" || a === "--secret" || a === "--role" || a === "--timeout" || a === "--my-url" || a === "--as") {
 			out.flags[a.slice(2)] = argv[++i] ?? "";
 			continue;
 		}
@@ -91,7 +94,11 @@ async function call(api, secret, path, init = {}) {
 			signal: AbortSignal.timeout(Number(init.timeoutMs ?? 8000)),
 		});
 	} catch (err) {
-		die(`连接 ${api} 失败: ${err instanceof Error ? err.message : String(err)}\n（目标成员没启动？或用 --api 指定地址）`);
+		const reason = err instanceof Error ? err.message : String(err);
+		// soft: let the caller decide (e.g. keep receipts un-acked when the
+		// local member is down) instead of exiting.
+		if (init.soft) return { status: 0, payload: { ok: false, error: `连接 ${api} 失败: ${reason}` } };
+		die(`连接 ${api} 失败: ${reason}\n（目标成员没启动？或用 --api 指定地址）`);
 	}
 	let payload;
 	try { payload = await resp.json(); } catch { payload = { ok: false, error: `HTTP ${resp.status} (non-JSON)` }; }
@@ -123,7 +130,7 @@ function printStatus(payload, json) {
 async function main() {
 	const parsed = parseArgs(process.argv.slice(2));
 	const flags = parsed.flags;
-	if (flags.version) { console.log("dsh-fleet CLI 0.3.1"); return; }
+	if (flags.version) { console.log("dsh-fleet CLI 0.3.2"); return; }
 	if (flags.help || (parsed._[0] !== "status" && parsed._[0] !== "roster" && parsed._[0] !== "add" && parsed._[0] !== "remove" && parsed._[0] !== "send" && parsed._[0] !== "inbox" && parsed._.length > 0)) {
 		console.log(USAGE);
 		if (!flags.help && parsed._.length > 0) die(`未知命令: ${parsed._[0]}`);
@@ -135,6 +142,17 @@ async function main() {
 	const localCfg = local?.config ?? {};
 	const secret = flags.secret || process.env.DSH_FLEET_SECRET || localCfg.secret || die("缺少舰队密钥：用 --secret 或在本地 fleet.json / $DSH_FLEET_SECRET 提供");
 	const api = flags.api || process.env.DSH_FLEET_API || localCfg.advertise?.baseUrl || "http://127.0.0.1:43129";
+	const selfName = flags.as || localCfg.device || "";
+
+	/** Base URL of fleet member `dev`: local fleet.json first, then the API member's roster. */
+	async function resolvePeer(dev) {
+		const fromFile = (localCfg.peers ?? []).find((p) => p.device === dev)?.baseUrl;
+		if (fromFile) return fromFile;
+		const roster = mustOk(await call(api, secret, "/fleet/roster"), api);
+		if (roster.self?.device === dev) return api;
+		return (roster.peers ?? []).find((p) => p.device === dev)?.baseUrl
+			?? die(`名册里没有 ${dev}；先 dsh-fleet add ${dev} <baseUrl>`);
+	}
 
 	if (cmd === "status") {
 		const payload = mustOk(await call(api, secret, "/fleet/status"), api);
@@ -183,17 +201,28 @@ async function main() {
 		const [dev, ...rest] = parsed._.slice(1);
 		const text = rest.join(" ");
 		if (!dev || !text) die("用法: dsh-fleet send <device> <text> [--wait] [--timeout SEC]");
+		if (selfName && dev === selfName) die(`不能给本机（${selfName}）派活——/fleet/message 会投进目标成员自己的管家，直接在本机对话即可`);
 		const wait = !!flags.wait;
+		// async receipts are addressed to the sender's device name; without one
+		// they'd be unclaimable by a scoped pull.
+		if (!wait && !selfName) die("异步派活需要本机设备名（回执按设备名归属）：用 --as NAME 或本地 fleet.json 的 device；或改用 --wait");
 		const timeoutSec = Math.min(Number(flags.timeout ?? 300) || 300, 3600);
-		const payload = mustOk(await call(api, secret, "/fleet/message", {
+		const target = await resolvePeer(dev);
+		const myUrl = localCfg.advertise?.baseUrl ?? "";
+		const payload = mustOk(await call(target, secret, "/fleet/message", {
 			method: "POST",
-			body: JSON.stringify({ device: dev, text, wait, timeoutSec, callback: localCfg.advertise?.baseUrl ? { device: localCfg.device, baseUrl: localCfg.advertise.baseUrl } : undefined }),
+			body: JSON.stringify({
+				text, wait, timeoutSec,
+				deliveryId: `d-${randomUUID().slice(0, 8)}`,
+				...(selfName ? { from: selfName } : {}),
+				...(selfName && myUrl ? { callback: { device: selfName, baseUrl: myUrl } } : {}),
+			}),
 			timeoutMs: wait ? (timeoutSec * 1000 + 8000) : 8000,
-		}), api);
+		}), target);
 		if (flags.json) { console.log(JSON.stringify(payload, null, 2)); return; }
 		if (payload.async) {
 			console.log(`已投递 ${dev}（异步）deliveryId=${payload.deliveryId}`);
-			console.log(`回执: ${localCfg.advertise?.baseUrl ? "完成后自动推送回本机收件箱" : `稍后用 dsh-fleet inbox ${dev} 拉取`}`);
+			console.log(`回执: ${selfName && myUrl ? "完成后自动推送回本机收件箱" : `稍后用 dsh-fleet inbox ${dev} 拉取`}`);
 		} else {
 			console.log(payload.reply ?? `（${dev} 无回复文本）`);
 		}
@@ -203,18 +232,37 @@ async function main() {
 	if (cmd === "inbox") {
 		const dev = parsed._[1];
 		if (!dev) die("用法: dsh-fleet inbox <device>   （拉取该成员替本机保留的回执）");
-		// find the peer's baseUrl: prefer local config, else ask our API's roster
-		let baseUrl = (localCfg.peers ?? []).find((p) => p.device === dev)?.baseUrl;
-		if (!baseUrl) {
-			const roster = mustOk(await call(api, secret, "/fleet/roster"), api);
-			baseUrl = (roster.peers ?? []).find((p) => p.device === dev)?.baseUrl;
-		}
-		if (!baseUrl) die(`名册里没有 ${dev}；先 dsh-fleet add ${dev} <baseUrl>`);
-		const payload = mustOk(await call(baseUrl, secret, "/fleet/replies"), baseUrl);
-		if (flags.json) { console.log(JSON.stringify(payload, null, 2)); return; }
+		if (!selfName) die("需要本机设备名才能认领回执：用 --as NAME 或本地 fleet.json 的 device");
+		const baseUrl = await resolvePeer(dev);
+		const payload = mustOk(await call(baseUrl, secret, `/fleet/replies?for=${encodeURIComponent(selfName)}`), baseUrl);
 		const rs = payload.receipts ?? [];
-		if (!rs.length) { console.log(`（${dev} 上没有未送达回执）`); return; }
+		// Store into the local member's inbox (same path as a push) so the
+		// local agent's fleet_inbox sees them too; ack the peer only for what
+		// was stored. A legacy (pre-0.3.2) peer already consumed them on read.
+		const stored = [];
+		for (const r of rs) {
+			const fwd = await call(api, secret, "/fleet/message", {
+				method: "POST",
+				soft: true,
+				body: JSON.stringify({ type: "receipt", device: dev, key: r.key, deliveryId: r.deliveryId, kind: r.kind, text: r.text }),
+			});
+			if (fwd.payload?.ok) stored.push(r.key);
+		}
+		let ackNote = "";
+		if (payload.scoped === true && stored.length) {
+			const ack = await call(baseUrl, secret, "/fleet/replies", { method: "POST", soft: true, body: JSON.stringify({ for: selfName, keys: stored }) });
+			if (!ack.payload?.ok) ackNote = `确认失败（${ack.payload?.error ?? ack.status}），下次拉取会重复返回（本机收件箱已去重）`;
+		}
+		const unstored = rs.length - stored.length;
+		if (unstored) {
+			ackNote = payload.scoped === true
+				? `${unstored} 条未能存入本机收件箱（${api} 未运行？），已保留在 ${dev}，可稍后重拉`
+				: `${unstored} 条未能存入本机收件箱，且 ${dev} 为旧版协议、已在读取时删除——请保存下面的输出`;
+		}
+		if (flags.json) { console.log(JSON.stringify({ ...payload, stored: stored.length, note: ackNote || undefined }, null, 2)); return; }
+		if (!rs.length) { console.log(`（${dev} 上没有给 ${selfName} 的未送达回执）`); return; }
 		for (const r of rs) console.log(`[${r.kind}] ${r.deliveryId}: ${r.text}`);
+		console.log(`\n已存入本机收件箱 ${stored.length}/${rs.length} 条${ackNote ? `；${ackNote}` : ""}`);
 		return;
 	}
 }
