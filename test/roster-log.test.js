@@ -106,3 +106,15 @@ test("merge reports rejected events with their reasons", async () => {
 	assert.equal(res.added, 1);
 	assert.deepEqual(res.rejected, [{ hash: bad.hash, reason: "not-a-member" }]);
 });
+
+test("join and create events with a non-string name are rejected as bad-type", async () => {
+	const { ids, create } = await makeFleet(2);
+	const log = new RosterLog([create]);
+	const e = createEvent(ids[0], { fleetId: FLEET_ID, type: "member.join", parents: [create.hash], body: { memberId: ids[1].memberId, publicKeyPem: ids[1].publicKeyPem, name: 123 } });
+	assert.equal(log.add(e).reason, "bad-type");
+	const other = await makeFleet(1);
+	const badCreate = createEvent(other.ids[0], { fleetId: FLEET_ID, type: "fleet.create", parents: [], body: { ...other.create.body, creator: { ...other.create.body.creator, name: { x: 1 } } } });
+	assert.equal(new RosterLog().add(badCreate).reason, "bad-type");
+	const badDescribe = createEvent(ids[0], { fleetId: FLEET_ID, type: "member.describe", parents: [create.hash], body: { name: ["x"], description: "d" } });
+	assert.equal(log.add(badDescribe).reason, "bad-type");
+});
