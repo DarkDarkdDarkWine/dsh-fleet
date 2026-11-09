@@ -13,13 +13,14 @@ test("localAddresses skips internal and IPv6, keeps 100.x tailscale", () => {
 	]);
 });
 
-test("localAddresses skips docker0, br-1a2b, veth9 and 169.254.x.x but keeps enp2s0", () => {
+test("localAddresses skips docker0, br-1a2b, veth9, 169.254.x.x and 198.18.x.x but keeps enp2s0", () => {
 	const ifaces = {
 		enp2s0: [v4("192.168.31.14")],
 		docker0: [v4("172.17.0.1")],
 		"br-1a2b": [v4("192.168.0.1")],
 		veth9: [v4("10.9.0.1")],
 		eth1: [v4("169.254.10.2")],
+		utun7: [v4("198.18.0.1")], // proxy TUN fake-IP range (Shadowrocket/Clash)
 	};
 	assert.deepEqual(localAddresses(1, ifaces), [{ host: "192.168.31.14", port: 1 }]);
 });
@@ -65,3 +66,20 @@ test("online after markSeen, offline after offlineAfterMisses misses", () => {
 	const again = new AddressBook({ load: () => store.saved, save: () => {}, now: () => clock.t });
 	assert.equal(again.snapshot().m.lastSeenAt, 1000);
 });
+
+test("a failed attempt demotes an address below one not yet tried", () => {
+	const { b, clock } = book();
+	b.record("m", { host: "10.0.0.1", port: 1 }, false);
+	clock.t += 10;
+	b.record("m", { host: "10.0.0.2", port: 1 }, false);
+	assert.deepEqual(b.candidates("m")[0], { host: "10.0.0.2", port: 1 });
+	clock.t += 10;
+	b.fail("m", { host: "10.0.0.2", port: 1 });
+	assert.deepEqual(b.candidates("m").map((a) => a.host), ["10.0.0.1", "10.0.0.2"]);
+	clock.t += 10;
+	b.record("m", { host: "10.0.0.2", port: 1 }, false); // reported again later: fresh again
+	assert.deepEqual(b.candidates("m")[0], { host: "10.0.0.2", port: 1 });
+	b.fail("m", { host: "9.9.9.9", port: 1 }); // unknown address: no-op
+	assert.equal(b.candidates("m").length, 2);
+});
+
