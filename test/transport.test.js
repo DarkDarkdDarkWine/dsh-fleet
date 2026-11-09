@@ -37,6 +37,7 @@ test("member route accepts B and passes memberId to the handler", async () => {
 	assert.equal(r.status, 200);
 	assert.deepEqual(r.body, { pong: 7, from: B.memberId });
 	assert.deepEqual(r.address, at()[0]);
+	assert.equal(r.peerMemberId, A.memberId);
 	assert.equal(seen.at(-1).memberId, B.memberId);
 });
 
