@@ -2,37 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import https from "node:https";
 import net from "node:net";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as plugin from "../lib/index.js";
 import { callLocal } from "../lib/local-client.js";
+import { dataDir, runPlugin } from "./helpers/plugin.js";
 
-/** Fake cordis ctx: effect() runs at once and collects disposers, like Fiber.effect. */
-function fakeCtx() {
-	const disposers = [];
-	return {
-		disposers,
-		logger: { info() {}, warn() {} },
-		effect(fn) { const d = fn(); if (typeof d === "function") disposers.push(d); return () => d?.(); },
-		setInterval(fn, ms) { const t = setInterval(fn, ms); t.unref?.(); const d = () => clearInterval(t); disposers.push(d); return d; },
-		dispose: async () => { for (const d of disposers.splice(0).reverse()) await d(); },
-	};
-}
-
-function dataDir(settings = {}) {
-	const dir = mkdtempSync(join(tmpdir(), "fleet-plugin-"));
-	writeFileSync(join(dir, "settings.json"), JSON.stringify({ port: 0, host: "127.0.0.1", tailscale: { enabled: false }, ...settings }));
-	return dir;
-}
-
-async function run(dir) {
-	process.env.DSH_FLEET_DIR = dir;
-	const ctx = fakeCtx();
-	const handle = plugin.apply(ctx, {});
-	await handle.ready;
-	return { ctx, handle };
-}
+const run = runPlugin;
 
 const portFree = (port) => new Promise((resolve) => {
 	const s = net.createServer().once("error", () => resolve(false)).listen(port, "127.0.0.1", () => s.close(() => resolve(true)));
