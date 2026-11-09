@@ -202,3 +202,34 @@
 3. **桌面修复流程会清掉手动停用的条目**：安全模式修复时，写进 `cordis.patch.yml` 的 `disabled: true` 会被开机修复清掉。要彻底修好，只能改插件包本身或完整卸载（GLM 实测）。
 4. **探针事故的副作用**：GLM 的探针 0.2.0 往用户会话 `session-7ec7aff5…`、`session-e4e490cf…` 和 `fleet-steward-mac-gui` 里各注入了一条测试消息，那几轮都失败了。测试会话"舰队探针测试会话"（`session-c7ceb4c0…`）留给用户自行删除。
 5. **tar 跨机传输**：macOS → Linux 用 `tar czf` 会刷出大量 xattr 警告，无害；用 `COPYFILE_DISABLE=1` 可以消除（GLM 实测）。
+
+## 计划一真机验证（2026-11-08，Task 12 Step 4）
+
+**做法：** 两台设备都在临时数据目录里独立运行插件入口（`lib/index.js` 的 `apply`，配一个假的 cordis ctx），**没有装进 DSH**，用户在用的 0.3.1 不受影响。
+
+- Mac：用 DSH Desktop 自带的运行时运行（`ELECTRON_RUN_AS_NODE=1`，BoringSSL）；
+- NAS：用它自己的 Node v24.14.1（OpenSSL）运行；
+- 两边的舰队端口都是 43190。
+
+**结果【实测】：**
+
+| 步骤 | 结果 |
+|---|---|
+| NAS `dsh-fleet create 验证舰队` | ✓ 舰队 `1D22-379C` |
+| Mac `dsh-fleet discover` | ✓ 经 Tailscale 发现 `1D22-379C 验证舰队 经由 100.85.254.124:43190（tailscale）`（两台不在同一网段，mDNS 发现不了） |
+| Mac `dsh-fleet join`（不带 `--address`，自动选唯一舰队）+ PIN | ✓ 共 2 台成员；BoringSSL ↔ OpenSSL 双向 TLS 正常 |
+| 心跳（默认 `heartbeatSec: 30`） | ✓ 两边都显示对方在线，首选地址都是对方的 Tailscale IP |
+| NAS `dsh-fleet remove 52de67d0` + PIN | ✓ 打印"建议修改 PIN"；Mac 在 3 秒内变为"⚠ 已被移出舰队" |
+
+**真机暴露的三个问题（都已修复并补了测试）：**
+
+1. **超时太短**：经 Tailscale 中继，Mac→NAS 一次请求实测要 1.3–2.2 秒（TCP 连接约 0.4 秒，TLS 还要几个来回），原来 1.5 秒的 hello 探测超时会漏掉 NAS。
+   - 改为：请求默认超时 6 秒、hello 探测 5 秒、心跳每个地址最多 6 秒（总时长仍不超过 `heartbeatSec / 2`）。
+   - 提交 07943bb。
+   - 注：`heartbeatSec` 设得太小时（例如 5 秒），预算分到每个地址不到 1 秒，中继链路上的心跳会时通时断。保持默认的 30 秒。
+2. **失败的地址被提前**：心跳失败时，旧代码把尝试过的地址记成"刚见过"，结果下一轮排在最前面的，反而是最后一个连不上的地址。
+   - 新增 `AddressBook.fail()`：只记失败，不刷新"见过"的时间。
+   - 提交 b1d2416。
+3. **代理的虚拟 IP**：Mac 广播了 `198.18.0.1`，这是 Shadowrocket 的 TUN 虚拟地址（198.18.0.0/15 段）。
+   - 现在枚举本机地址时跳过这个段。
+   - 提交 b1d2416。
