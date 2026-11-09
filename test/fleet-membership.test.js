@@ -198,3 +198,18 @@ test("the rejected flag clears on the next successful heartbeat", async () => {
 		assert.equal(b.fleet.status().self.rejected, false);
 	} finally { await f.stop(); }
 });
+
+test("with 8 known addresses, the address that last worked still gets a full timeout on a slow link", { timeout: 30_000 }, async () => {
+	const { f, a, b, c } = await three();
+	try {
+		await tick(a, b, b);
+		const cId = c.fleet.identity.memberId;
+		assert.equal(member(b, "c").online, true);
+		for (let i = 1; i <= 7; i++) b.fleet.book.record(cId, { host: `10.255.0.${i}`, port: 43190 }, false); // stale LAN addresses
+		assert.deepEqual(b.fleet.book.candidates(cId)[0], c.address(), "the working address ranks first");
+		const handle = c.fleet.handleHeartbeat.bind(c.fleet);
+		c.fleet.handleHeartbeat = async (ctx) => { await new Promise((r) => setTimeout(r, 2500)); return handle(ctx); }; // relayed path
+		await tick(b);
+		assert.equal(b.fleet.book.entry(cId).misses, 0, "default heartbeatSec 30 → 15 s budget; 15/8 s per address would time out");
+	} finally { await f.stop(); }
+});
