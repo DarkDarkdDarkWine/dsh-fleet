@@ -115,3 +115,18 @@ test("with tailscale.enabled \"auto\" and no CLI found, no tailscale source is c
 		assert.deepEqual(n.fleet.status().discovery, { mdns: "on", tailscale: "off" });
 	} finally { await n.stop(); }
 });
+
+test("an mDNS instance created after stop() is destroyed at once", async () => {
+	const bonjour = fakeBonjour();
+	let resolveCreate;
+	const d = createDiscovery({ createBonjour: () => new Promise((r) => { resolveCreate = r; }) });
+	d.advertise({ fleetId: "", memberId: "a".repeat(32), name: "mac", port: 1 });
+	d.onFound(() => {});
+	d.stop();
+	resolveCreate(bonjour);
+	await new Promise((r) => setImmediate(r));
+	assert.equal(bonjour.destroyed, true);
+	assert.equal(bonjour.published.length, 0, "nothing is published after stop");
+	assert.equal(bonjour.browsers.length, 0);
+});
+
