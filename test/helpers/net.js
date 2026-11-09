@@ -15,14 +15,14 @@ export const quietLogger = { info() {}, warn() {} };
 
 /**
  * @param {string} name
- * @param {{ dir?: string, settings?: object, discovery?: object, now?: () => number }} [opts]
+ * @param {{ dir?: string, settings?: object, discovery?: object, discoveryInfo?: object, now?: () => number }} [opts]
  */
 export async function startNode(name, opts = {}) {
 	const dir = opts.dir ?? mkdtempSync(join(tmpdir(), `fleet-${name}-`));
 	writeFileSync(join(dir, "settings.json"), JSON.stringify({ port: 0, host: "127.0.0.1", ...opts.settings }));
 	const identity = await loadOrCreateIdentity(dir);
 	const discovery = opts.discovery ?? fakeDiscovery();
-	const fleet = new FleetService({ dataDir: dir, settings: loadSettings(dir), identity, discovery, logger: quietLogger, now: opts.now });
+	const fleet = new FleetService({ dataDir: dir, settings: loadSettings(dir), identity, discovery, discoveryInfo: opts.discoveryInfo, logger: quietLogger, now: opts.now });
 	await fleet.start();
 	return { name, dir, fleet, discovery, address: () => ({ host: "127.0.0.1", port: fleet.status().listening.port }), stop: () => fleet.stop() };
 }
