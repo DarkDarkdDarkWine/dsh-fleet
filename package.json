@@ -1,7 +1,7 @@
 {
   "name": "dsh-fleet",
-  "version": "0.3.2",
-  "description": "Multi-device fleet for DeepSeek Harness: steward sessions, peer heartbeat/roster, and A2A message delivery over the tailnet",
+  "version": "1.0.0-alpha.1",
+  "description": "Decentralized multi-device fleet for DeepSeek Harness: signed roster, PIN join, mutual-TLS port, heartbeat, mDNS and Tailscale discovery",
   "type": "module",
   "main": "lib/index.js",
   "bin": {
@@ -15,14 +15,14 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:desktop": "node scripts/test-desktop.mjs"
   },
   "files": [
-    "lib/index.js",
-    "lib/client.js",
-    "bin/dsh-fleet.js",
+    "lib",
+    "bin",
     "cordis.patch.yml",
-    "skills/fleet-ops/SKILL.md",
+    "skills",
     "README.md",
     "LICENSE"
   ],
@@ -49,5 +49,15 @@
       ],
       "platform": "web"
     }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@peculiar/asn1-schema": "^3.0.0",
+    "@peculiar/x509": "^3.1.0",
+    "asn1js": "^4.0.0",
+    "bonjour-service": "^1.4.4",
+    "reflect-metadata": "^0.2.2"
   }
 }
