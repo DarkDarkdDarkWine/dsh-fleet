@@ -99,8 +99,19 @@ test("a dead address costs at most timeoutMs", async () => {
 	const blackhole = net.createServer((s) => sockets.push(s)); // accepts TCP, never speaks TLS
 	await new Promise((r) => blackhole.listen(0, "127.0.0.1", r));
 	const started = Date.now();
-	await assert.rejects(requestMember({ identity: B, addresses: [{ host: "127.0.0.1", port: blackhole.address().port }], expectMemberId: A.memberId, method: "POST", path: "/v1/ping", body: {} }), UnreachableError);
+	await assert.rejects(requestMember({ identity: B, addresses: [{ host: "127.0.0.1", port: blackhole.address().port }], expectMemberId: A.memberId, method: "POST", path: "/v1/ping", body: {}, timeoutMs: 3000 }), UnreachableError);
 	assert.ok(Date.now() - started < 3500, `took ${Date.now() - started} ms`);
 	for (const s of sockets) s.destroy();
 	blackhole.close();
 });
+
+test("the default timeout tolerates a slow relayed path (answer after 3.5 s)", { timeout: 20_000 }, async () => {
+	const slow = await startFleetServer({ identity: A, host: "127.0.0.1", port: 0, bodyLimitBytes: 1024, isMember: () => true, logger: quiet, routes: {
+		"/v1/slow": { auth: "member", method: "POST", handler: async () => { await new Promise((r) => setTimeout(r, 3500)); return { status: 200, body: { ok: true } }; } },
+	} });
+	try {
+		const r = await requestMember({ identity: B, addresses: at(slow.port), expectMemberId: A.memberId, method: "POST", path: "/v1/slow", body: {} });
+		assert.equal(r.status, 200);
+	} finally { await slow.close(); }
+});
+

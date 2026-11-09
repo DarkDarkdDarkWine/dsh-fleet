@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createTailscaleDiscovery, findTailscaleCli, parseTailscalePeers } from "../lib/discovery-tailscale.js";
+import { createTailscaleDiscovery, findTailscaleCli, helloProbe, parseTailscalePeers } from "../lib/discovery-tailscale.js";
+import { startFleetServer } from "../lib/transport/server.js";
+import { makeIdentities } from "./helpers/roster.js";
 
 // Trimmed, anonymised `tailscale status --json`.
 const SAMPLE = {
@@ -90,3 +92,16 @@ test("scanning starts on the first listener and stops with stop()", async () => 
 	d.stop();
 	assert.equal(cleared, true);
 });
+
+test("helloProbe waits long enough for a relayed Tailscale path (answer after 2.5 s)", { timeout: 15_000 }, async () => {
+	const [id] = await makeIdentities(1);
+	const slow = await startFleetServer({ identity: id, host: "127.0.0.1", port: 0, bodyLimitBytes: 1024, isMember: () => false, routes: {
+		"/v1/hello": { auth: "open", method: "GET", handler: async () => { await new Promise((r) => setTimeout(r, 2500)); return { status: 200, body: hello(id.memberId) }; } },
+	} });
+	try {
+		const h = await helloProbe("127.0.0.1", slow.port);
+		assert.equal(h?.memberId, id.memberId);
+		assert.equal(await helloProbe("127.0.0.1", 1), null, "an unreachable peer yields null");
+	} finally { await slow.close(); }
+});
+
