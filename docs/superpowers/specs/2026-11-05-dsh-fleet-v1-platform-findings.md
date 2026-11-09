@@ -233,3 +233,20 @@
 3. **代理的虚拟 IP**：Mac 广播了 `198.18.0.1`，这是 Shadowrocket 的 TUN 虚拟地址（198.18.0.0/15 段）。
    - 现在枚举本机地址时跳过这个段。
    - 提交 b1d2416。
+
+## 计划一在 DSH 内加载验证（2026-11-08）
+
+经用户同意，用 `plugin_manager install_bundle` 把 v1（`npm pack` 打出的包）装进 Mac 的 DSH Desktop，替换了 0.3.1。
+
+**结果【实测】：**
+
+| 检查项 | 结果 |
+|---|---|
+| 启动 | ✓ 没有触发插件恢复，也没有进入安全模式；43190 由 DSH 的 harness 进程（DSH Desktop Helper）监听 |
+| 数据目录 | ✓ `$DSH_HOME/fleet/`，即 `…/dsh-desktop/harness/fleet/`，生成 `identity.json` 和 `control.json`；v0.3 的 `fleet*.json` 原样不动 |
+| CLI | ✓ `--dir` 指向上面的目录后，`status` 和 `create` 都正常（测试舰队 `BB94-9016`） |
+| `ctx.setInterval` | ✓ 本机另起一个临时节点入网后，DSH 自己的心跳在约 30 秒内成功连到对方真实的 `127.0.0.1:43192` |
+| `ctx.effect` 清理 / 重启 | ✓ 退出时 harness 进程以 0 退出；新进程重新绑定 43190，没有出现 EADDRINUSE；舰队和成员都还在，对方再次显示在线 |
+| `inject: ["timer"]`，不导出 `Config`，`ctx.logger` | ✓ 加载时没有报错 |
+
+**顺带观察到：** mDNS 发现的地址被直接记成"已验证"，这是审阅意见里推迟处理的一个小问题。临时节点只监听 127.0.0.1，DSH 却先去连 mDNS 报来的 `192.168.0.250:43192`，失败后才换到 127.0.0.1 成功，相当于每次多试一个地址，结果不受影响。
