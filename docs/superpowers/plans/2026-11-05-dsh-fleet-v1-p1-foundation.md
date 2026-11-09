@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 做出一个能用 CLI 管理的去中心化舰队：设备身份、签名名册、自有加密端口、PIN 建舰队与入网、心跳与地址自动更新、局域网发现、移除成员与修改/重置 PIN。
+**Goal:** 做出一个能用 CLI 管理的去中心化舰队：设备身份、签名名册、自有加密端口、PIN 建舰队与入网、心跳与地址自动更新、局域网与 Tailscale 发现、移除成员与修改/重置 PIN。
 
-**Architecture:** 插件自己用 `node:https` 开一个端口，成员之间双向 TLS，靠证书里的设备公钥识别身份。名册是一份哈希链接、逐条签名的事件日志，由纯函数 `foldState` 推导出成员状态。`FleetService` 负责编排，心跳负责名册同步和地址交换，mDNS 负责局域网发现。CLI 通过本机回环地址加令牌控制插件。派活、会话、AI 工具、面板不在本计划。
+**Architecture:** 插件自己用 `node:https` 开一个端口，成员之间双向 TLS，靠证书里的设备公钥识别身份。名册是一份哈希链接、逐条签名的事件日志，由纯函数 `foldState` 推导出成员状态。`FleetService` 负责编排，心跳负责名册同步和地址交换，mDNS 和 Tailscale 两个来源负责发现。CLI 通过本机回环地址加令牌控制插件。派活、会话、AI 工具、面板不在本计划。
 
-**Tech Stack:** Node ≥ 20（ESM，JS + JSDoc）；`node:crypto`（Ed25519、scrypt、sha256）；`node:https`；`@peculiar/x509` ^3.1.0（生成自签证书）；`bonjour-service` ^1.4.4（mDNS）；测试用 `node:test`。
+**Tech Stack:** Node ≥ 20（ESM，JS + JSDoc）；`node:crypto`（ECDSA P-256、scrypt、sha256）；`node:https`；`@peculiar/x509` ^3.1.0（生成自签证书）；`bonjour-service` ^1.4.4（mDNS）；测试用 `node:test`。
 
 **Spec:** `docs/superpowers/specs/2026-11-05-dsh-fleet-v1-design.md`
+
+**平台结论:** `docs/superpowers/specs/2026-11-05-dsh-fleet-v1-platform-findings.md`（Task 0 的产出，执行任何任务前都要读）
 
 **v1 的三份计划：**
 
@@ -16,12 +18,16 @@
 - **计划二**：派活与会话，覆盖 §5.8、§5.9、§5.11。
 - **计划三**：面板、通知、迁移、发布，覆盖 §5.10、§5.14，以及 fleet-ops 技能和 README。
 
-计划二、三要等本计划的 Task 0 结论出来后再写。
+Task 0 已完成（2026-11-08），计划二、三可以开始写。
 
 ## Global Constraints
 
 - Node ≥ 20：`package.json` 写 `"engines": { "node": ">=20" }`；纯 ESM。
-- 运行时依赖只允许 `@peculiar/x509` ^3.1.0 和 `bonjour-service` ^1.4.4，其余一律用 Node 内置模块。不自己实现任何密码学原语。
+- 运行时依赖只允许：`@peculiar/x509` ^3.1.0、它的 peer `@peculiar/asn1-schema` ^3.0.0 和 `asn1js` ^4.0.0、`reflect-metadata` ^0.2.2、`bonjour-service` ^1.4.4。其余一律用 Node 内置模块。不自己实现任何密码学原语。
+  - 任何导入 `@peculiar/x509` 的模块，都必须先 `await import("reflect-metadata")`（findings 第 2 项）。
+- **只用 ECDSA P-256，不用 Ed25519**：DSH 桌面版内置的 Node 是 BoringSSL，用 Ed25519 证书做 TLS 握手会失败（findings 第 2 项）。
+- **两个运行时都要通过测试**：`npm test` 用官方 Node 跑；`npm run test:desktop` 用 DSH 桌面版的运行时跑（`ELECTRON_RUN_AS_NODE=1 "$DSH_DESKTOP_BIN" --test test/*.test.js`，`DSH_DESKTOP_BIN` 在 macOS 上默认是 `/Applications/DSH Desktop.app/Contents/MacOS/DSH Desktop`，找不到时打印"跳过"并以 0 退出）。注意 harness shell 里的 `node` 可能就是桌面版的那个，要显式区分。
+- **插件里的一切注册都放进 `ctx.effect`**：`webServer.register`、`tools.register` 返回撤销函数，但不会随插件卸载自动撤销，重复注册还会抛错。写法是 `ctx.effect(() => ctx.webServer.register(...))`。自开端口的关闭写成 `ctx.effect(() => () => server.close())`。cordis 4 **没有** `dispose` 事件，不使用 `ctx.on("dispose")`（findings 第 9 项）。
 - 版本号 `1.0.0-alpha.1`（`package.json` 和 `lib/version.js` 两处一致）。**本计划期间不发布到 npm**。
 - `package.json` 的 `files` 改为 `["lib", "bin", "cordis.patch.yml", "skills", "README.md", "LICENSE"]`。
 - 单个文件不超过 800 行，函数不超过 50 行。
@@ -42,18 +48,19 @@
   | `deliveryTtlHours` | `24` |
   | `bodyLimitBytes` | `2097152` |
   | `agent` | `{ provider:"", model:"", preset:"", cwd:"" }` |
+  | `tailscale` | `{ enabled: "auto", scanSec: 60, cli: "" }`（`enabled` 取 `"auto"` / `true` / `false`；`cli` 为空时自动查找） |
 - 每个提交使用 conventional commits，直接提交到 `main`。提交代码前先跑 `npm test` 和 `/verify`。
 
-**本计划对 spec 的两处落地调整（在执行前告知用户）：**
+**本计划对 spec 的两处落地调整（用户已知悉）：**
 
-1. spec §5.2 说 CLI 走 DSH Web 服务上的本机接口。但插件拿不到 DSH Web 绑定的地址（NAS 上是 Tailscale IP），所以改为：**CLI 走插件自己端口上的 `/local/*` 路由，只接受回环来源 + 令牌**。面板（计划三）仍走 DSH Web。
+1. spec §5.2 说 CLI 走 DSH Web 服务上的本机接口。但插件拿不到 DSH Web 绑定的地址（NAS 上是 Tailscale IP），所以改为：**CLI 走插件自己端口上的 `/local/*` 路由，只接受回环来源 + 令牌**。面板（计划三）仍走 DSH Web。另外，DSH 不替插件的 Web 路由做鉴权（findings 意外发现 1），计划三的面板路由要自己鉴权。
 2. 新增 CLI 命令 `leave`：清空本机的舰队数据，并重新生成身份。被移除的设备只能用新身份重新入网（spec §5.3 规定"移除胜出"），所以需要这个入口。
 
 ## Review Focus
 
 1. **连续输错 PIN 之后重启插件**：锁定状态必须保留；锁定期间即使输入正确的 PIN 也要拒绝。测试在 Task 4、Task 11。
 2. **被移除的设备还在发心跳**：其他成员一律返回 `401 not-a-member`；它的 `status().self.rejected` 变为 `true`；它在被移除之后签发的事件全部无效。测试在 Task 8。
-3. **对方的 IP 变了**：旧地址超时后会尝试下一个地址；通过地址交换或 mDNS 学到新地址后能恢复通信；一个不通的地址不会把整轮心跳拖过 `heartbeatSec`。测试在 Task 6、Task 8。
+3. **对方的 IP 变了**：旧地址超时后会尝试下一个地址；通过地址交换或发现（mDNS / Tailscale）学到新地址后能恢复通信；一个不通的地址不会把整轮心跳拖过 `heartbeatSec`。测试在 Task 6、Task 8。
 4. **写文件时崩溃，或文件损坏**：所有写入都用"临时文件 + rename"。`roster.json` 损坏时拒绝启动舰队，并报 `roster-corrupt`，**绝不覆盖重建**；`identity.json` 同理。测试在 Task 1、Task 11。
 5. **端口被占用**：`apply()` 不抛错，`status().listening` 为 `{ error: "EADDRINUSE" }`，CLI 的 `status` 命令能显示出来。测试在 Task 10。
 
@@ -77,7 +84,8 @@
 | `lib/addresses.js` | 本机地址枚举、`AddressBook` |
 | `lib/fleet.js` | `FleetService`：创建/入网/移除/PIN/描述/状态 |
 | `lib/heartbeat.js` | 心跳、名册同步、地址交换、在线判定 |
-| `lib/discovery.js` | mDNS 广播与发现（可注入替身） |
+| `lib/discovery.js` | mDNS 广播与发现（可注入替身），以及合并多个来源的 `combineDiscovery` |
+| `lib/discovery-tailscale.js` | Tailscale 来源：找 CLI、解析 `tailscale status --json`、探测 `/v1/hello` |
 | `lib/local-routes.js` | CLI 用的 `/local/*` 控制路由 |
 | `lib/index.js` | 插件入口（替换 v0.3） |
 | `bin/dsh-fleet.js` | CLI（替换 v0.3） |
@@ -87,12 +95,14 @@ v0.3 的 `lib/client.js` 本计划不动。它请求的 `/fleet/panel` 会返回
 
 ---
 
-### Task 0: 平台能力验证（spike，不进产品代码）
+### Task 0: 平台能力验证（spike，不进产品代码）——已完成
+
+结论见 `docs/superpowers/specs/2026-11-05-dsh-fleet-v1-platform-findings.md`（提交 45b9755）。第 2 项失败（Ed25519 不能用于 TLS），最终没有采用下面 Step 2 的"Ed25519 背书"降级方案，改为全程只用一把 P-256 密钥（spec §5.1 已更新）。以下保留原始清单。
 
 **Files:**
 - Create: `docs/superpowers/specs/2026-11-05-dsh-fleet-v1-platform-findings.md`
 
-- [ ] **Step 1：查清下列 9 项，每项记录"结论 + 证据（源码路径或实测命令与输出）+ 对计划二、三的影响"**
+- [x] **Step 1：查清下列 9 项，每项记录"结论 + 证据（源码路径或实测命令与输出）+ 对计划二、三的影响"**
   1. DSH Desktop 内置 Node 的版本（`process.version`，在插件 `apply` 里打日志获得）
   2. 在该运行时里，`@peculiar/x509` 能否生成 Ed25519 自签证书，`node:https` 能否用它完成双向 TLS 握手（写一个 30 行的探针脚本，在 Desktop 内置 Node 下运行）
   3. 桌面版里插件能否 `listen("0.0.0.0", 43190)`，macOS 是否弹防火墙提示
@@ -103,10 +113,9 @@ v0.3 的 `lib/client.js` 本计划不动。它请求的 `/fleet/panel` 会返回
   8. spec §8.5：客户端面板能否弹出模态框
   9. cordis `ctx.on("dispose", fn)` 是否在插件卸载或重载时触发（决定 Task 10 怎么关闭服务）
 
-- [ ] **Step 2：如果第 2 项失败，在 findings 里写明降级方案，并同步改 Task 2 的接口说明**
-  降级方案：设备身份仍用 Ed25519 签名；TLS 改用一把独立的 ECDSA P-256 密钥，并由 Ed25519 身份签名背书（证书扩展里存 `ed25519 公钥 + 签名`），对端校验背书。
+- [x] **Step 2：如果第 2 项失败，在 findings 里写明降级方案，并同步改 Task 2 的接口说明**（已改为单把 P-256 密钥，Task 2 已更新）
 
-- [ ] **Step 3：提交**
+- [x] **Step 3：提交**
 
 ```bash
 git add docs/superpowers/specs/2026-11-05-dsh-fleet-v1-platform-findings.md
@@ -119,7 +128,8 @@ git commit -m "docs: v1 platform capability findings"
 
 **Files:**
 - Create: `lib/version.js`, `lib/paths.js`, `lib/store.js`, `lib/settings.js`
-- Modify: `package.json`（版本号、`engines`、`files`、依赖、`"test": "node --test test/**/*.test.js"`）
+- Create: `scripts/test-desktop.mjs`（找到桌面版运行时并用它跑 `--test`；找不到时打印"跳过：未找到 DSH Desktop"并以 0 退出）
+- Modify: `package.json`（版本号、`engines`、`files`、依赖、`"test": "node --test test/*.test.js"`、`"test:desktop": "node scripts/test-desktop.mjs"`）
 - Test: `test/store.test.js`, `test/settings.test.js`
 
 **Interfaces:**
@@ -139,7 +149,7 @@ git commit -m "docs: v1 platform capability findings"
   - `loadSettings merges nested agent defaults`
   - `loadSettings rejects port 70000 with field "port"`
 - [ ] **Step 2：运行 `node --test test/store.test.js test/settings.test.js`，确认因模块缺失而失败**
-- [ ] **Step 3：实现上面四个文件；`npm install @peculiar/x509@^3.1.0 bonjour-service@^1.4.4`**
+- [ ] **Step 3：实现上面的文件；`npm install @peculiar/x509@^3.1.0 @peculiar/asn1-schema@^3.0.0 asn1js@^4.0.0 reflect-metadata@^0.2.2 bonjour-service@^1.4.4`**
 - [ ] **Step 4：重跑，确认全部通过**
 - [ ] **Step 5：提交** `feat: v1 storage, settings and data dir`
 
@@ -155,11 +165,11 @@ git commit -m "docs: v1 platform capability findings"
 - Consumes: `readJson`, `writeJsonAtomic`
 - Produces:
   - `type Identity = { memberId: string, publicKeyPem: string, privateKey: KeyObject, keyPem: string, certPem: string }`
-  - `loadOrCreateIdentity(dataDir: string, opts?: { regenerate?: boolean }): Promise<Identity>`：读写 `identity.json`（secret）。首次启动时生成 Ed25519 密钥和自签证书（CN = memberId，有效期 20 年）。文件损坏时抛 `StoreCorruptError`，不重建
+  - `loadOrCreateIdentity(dataDir: string, opts?: { regenerate?: boolean }): Promise<Identity>`：读写 `identity.json`（secret）。首次启动时用 `generateKeyPairSync("ec", { namedCurve: "prime256v1" })` 生成 P-256 密钥，并用同一把密钥生成自签证书（CN = memberId，有效期 20 年，签名算法 `{ name: "ECDSA", hash: "SHA-256" }`）。文件损坏时抛 `StoreCorruptError`，不重建
   - `memberIdOf(publicKeyPem: string): string`：对 SPKI DER 做 sha256，取前 32 个十六进制字符
   - `memberIdFromCert(cert: { raw: Buffer } | null): string | null`：从对端证书的 DER 解析公钥并计算 memberId
-  - `signBytes(identity: Identity, bytes: Buffer): string`（base64）
-  - `verifyBytes(publicKeyPem: string, bytes: Buffer, sig: string): boolean`
+  - `signBytes(identity: Identity, bytes: Buffer): string`：`crypto.sign("sha256", bytes, privateKey)`，DER 编码签名，返回 base64
+  - `verifyBytes(publicKeyPem: string, bytes: Buffer, sig: string): boolean`：公钥不是 P-256 时返回 `false`，不抛错
 
 - [ ] **Step 1：写失败测试**
   - `creates once and reloads the same memberId`
@@ -168,8 +178,10 @@ git commit -m "docs: v1 platform capability findings"
   - `sign/verify roundtrip; verify fails for a flipped byte`
   - `regenerate: true yields a different memberId`
   - `corrupt identity.json throws StoreCorruptError`
+  - `key is EC prime256v1 and the cert's public key equals the identity key`（`new X509Certificate(certPem).publicKey.asymmetricKeyDetails.namedCurve === "prime256v1"`）
+  - `verifyBytes returns false for an Ed25519 public key`
 - [ ] **Step 2：运行，确认失败**
-- [ ] **Step 3：实现**（证书用 `@peculiar/x509` 的 `X509CertificateGenerator.createSelfSigned`，密钥从 `node:crypto` 的 KeyObject 导出给 WebCrypto）
+- [ ] **Step 3：实现**（证书用 `@peculiar/x509` 的 `X509CertificateGenerator.createSelfSigned`，先 `await import("reflect-metadata")`；密钥从 `node:crypto` 的 KeyObject 以 pkcs8/spki DER 导出，再 `crypto.subtle.importKey(…, { name: "ECDSA", namedCurve: "P-256" }, true, …)` 交给 x509，`extractable` 必须为 `true`）
 - [ ] **Step 4：运行，确认通过**
 - [ ] **Step 5：提交** `feat: v1 device identity and self-signed cert`
 
@@ -274,7 +286,7 @@ git commit -m "docs: v1 platform capability findings"
 
 **Interfaces:**
 - Produces:
-  - `localAddresses(port: number, ifaces = os.networkInterfaces()): { host, port }[]`：非 internal 的 IPv4 地址，排序去重
+  - `localAddresses(port: number, ifaces = os.networkInterfaces()): { host, port }[]`：非 internal 的 IPv4 地址，排序去重。跳过网卡名匹配 `/^(docker|br-|veth|virbr|vmnet|vboxnet|cni|flannel|kube)/` 的接口，以及 `169.254.0.0/16` 链路本地地址（findings 第 4 项：NAS 上有几十个 docker 网桥）
   - `class AddressBook`：`constructor({ load, save, now })`
     - `record(memberId, addr, ok: boolean)`
     - `candidates(memberId): { host, port }[]`：最近成功的优先，其余按最近见到排序，最多保留 8 个
@@ -285,6 +297,7 @@ git commit -m "docs: v1 platform capability findings"
 
 - [ ] **Step 1：写失败测试**
   - `localAddresses skips internal and IPv6, keeps 100.x tailscale`（用伪造的 `ifaces`）
+  - `localAddresses skips docker0, br-1a2b, veth9 and 169.254.x.x but keeps enp2s0`
   - `candidates puts last-ok first, caps at 8`
   - `mergeGossip ignores self and never drops existing entries`
   - `online after markSeen, offline after offlineAfterMisses misses`
@@ -438,34 +451,57 @@ git commit -m "docs: v1 platform capability findings"
 
 ---
 
-### Task 9: 局域网发现
+### Task 9: 发现（mDNS + Tailscale）
 
 **Files:**
-- Create: `lib/discovery.js`, `test/helpers/fake-discovery.js`
+- Create: `lib/discovery.js`, `lib/discovery-tailscale.js`, `test/helpers/fake-discovery.js`
 - Modify: `lib/fleet.js`（启动广播、接入发现结果）
-- Test: `test/discovery.test.js`
+- Test: `test/discovery.test.js`, `test/discovery-tailscale.test.js`
 
 **Interfaces:**
+- Consumes: `requestMember`（Task 6，`expectMemberId: null`）
 - Produces:
-  - `createDiscovery({ bonjour = new Bonjour() }): { advertise(info), onFound(cb), stop() }`
+  - 所有发现来源共用一个接口 `Discovery = { advertise(info), onFound(cb), scanNow(): Promise<void>, stop() }`；`onFound(cb)` 中 `cb` 的参数为 `{ source: "mdns" | "tailscale", fleetId | null, fleetName?, memberId, name, host, port }`
+  - `createDiscovery({ bonjour = new Bonjour() }): Discovery`（mDNS 来源）
     - 服务类型 `dsh-fleet`，协议 tcp，端口为舰队端口
-    - txt 记录：`{ v: "1", fleet: fleetId || "", member: memberId, name }`
-    - `onFound(cb)` 中 `cb` 的参数为 `{ fleetId | null, fleetName? , memberId, name, host, port }`。txt 不带舰队名，舰队名靠对 `/v1/hello` 的查询获得
+    - txt 记录：`{ v: "1", fleet: fleetId || "", member: memberId, name }`。txt 不带舰队名，舰队名靠对 `/v1/hello` 的查询获得
+    - 收到的地址同样过滤 docker 等网卡地址（只保留 IPv4 且不是 `169.254.x.x`）
+    - `scanNow()` 直接 resolve
+  - `findTailscaleCli({ platform = process.platform, exists = fs.existsSync, configured = "" }): string | null`：`configured` 非空时只认它；否则按顺序找：
+    - darwin：`/Applications/Tailscale.app/Contents/MacOS/Tailscale`、`/opt/homebrew/bin/tailscale`、`/usr/local/bin/tailscale`
+    - linux：`/usr/bin/tailscale`、`/usr/local/bin/tailscale`、`/usr/sbin/tailscale`
+    - win32：`C:\Program Files\Tailscale\tailscale.exe`
+    - 都没有时，在 `PATH` 里找 `tailscale`（win32 找 `tailscale.exe`）
+  - `parseTailscalePeers(json: object): { host, hostName, os }[]`：`BackendState !== "Running"` 时返回空数组；只取 `Peer` 里 `Online === true` 的项，每项取 `TailscaleIPs` 里第一个 IPv4；跳过 `Self`
+  - `createTailscaleDiscovery({ runStatus(): Promise<object>, probe(host, port): Promise<HelloResponse | null>, port, scanSec, logger, setIntervalFn }): Discovery`
+    - `runStatus` 的默认实现：`execFile(cli, ["status", "--json"], { timeout: 5000 })` 后 `JSON.parse`
+    - `probe` 的默认实现：`requestMember({ addresses: [{ host, port }], expectMemberId: null, method: "GET", path: "/v1/hello", timeoutMs: 1500 })`，失败返回 `null`
+    - 每 `scanSec` 秒扫一次；同一时刻最多并发 8 个 probe；`runStatus` 失败时记一次 `logger.warn`，本轮返回空，不抛错
+    - `advertise` 为空操作（Tailscale 来源不广播）
+  - `combineDiscovery(sources: Discovery[]): Discovery`：`advertise`、`scanNow`、`stop` 分发给每个来源，`onFound` 合并所有来源
+  - 插件启动时按设置组合来源：`tailscale.enabled === false` 时不建；`"auto"` 时 `findTailscaleCli` 返回 `null` 就不建；`true` 但找不到 CLI 时，`status().discovery.tailscale = "cli-not-found"`
   - `FleetService` 新增方法：
-    - `discoverFleets(): { fleetId, short, fleetName, via: { memberId, host, port } }[]`：按 fleetId 分组，每个舰队给出一个可用于入网的地址
-    - `discoveredUnjoined(): { memberId, name, host, port }[]`：已入网的节点看到的、还没入网的设备（计划三在面板上用）
-  - 发现到已知成员时，用 `AddressBook.record(memberId, addr, true)` 补充地址。
+    - `discoverFleets(): Promise<{ fleetId, short, fleetName, via: { memberId, host, port, source } }[]>`：先 `await scanNow()`，再按 fleetId 分组，每个舰队给出一个可用于入网的地址（同一舰队有多个来源时优先 mdns）
+    - `discoveredUnjoined(): { memberId, name, host, port, source }[]`：已入网的节点看到的、还没入网的设备（计划三在面板上用）
+    - `status()` 增加 `discovery: { mdns: "on" | "off", tailscale: "on" | "off" | "cli-not-found" | "error" }`
+  - 发现到已知成员时，用 `AddressBook.record(memberId, addr, true)` 补充地址（两个来源都适用）。
+  - 发现结果里的 `memberId` 等于本机时忽略。
   - 入网或离开舰队后，重新广播。
 
-- [ ] **Step 1：写失败测试**（使用假 discovery）
+- [ ] **Step 1：写失败测试**（使用假 discovery、假 `runStatus` 和假 `probe`）
   - `advertise carries fleet id after create and empty fleet before`
   - `discoverFleets groups two members of one fleet into one entry with its name`
   - `discovering a known member adds its new address to the address book`
   - `discoveredUnjoined lists a node with empty fleet`
+  - `findTailscaleCli prefers configured path, then platform paths in order, then PATH; returns null when none exist`
+  - `parseTailscalePeers keeps only Online peers' first IPv4 and returns [] when BackendState is "Stopped"`（用一份脱敏的 `status --json` 样本做 fixture：一个在线 linux、一个离线 windows、一个在线 iOS）
+  - `tailscale scan probes online peers and reports those that answer /v1/hello with source "tailscale"`
+  - `a probe that times out does not block the others; runStatus failure logs one warning and yields nothing`
+  - `with tailscale.enabled "auto" and no CLI found, no tailscale source is created and status().discovery.tailscale is "off"`
 - [ ] **Step 2：运行，确认失败**
 - [ ] **Step 3：实现**
 - [ ] **Step 4：运行，确认通过**
-- [ ] **Step 5：提交** `feat: v1 mDNS discovery`
+- [ ] **Step 5：提交** `feat: v1 mDNS and Tailscale discovery`
 
 ---
 
@@ -478,7 +514,7 @@ git commit -m "docs: v1 platform capability findings"
 - Test: `test/plugin.test.js`
 
 **Interfaces:**
-- Consumes: `FleetService`, `createHeartbeat`, `createDiscovery`, `loadSettings`, `loadOrCreateIdentity`
+- Consumes: `FleetService`, `createHeartbeat`, `createDiscovery`, `findTailscaleCli`, `createTailscaleDiscovery`, `combineDiscovery`, `loadSettings`, `loadOrCreateIdentity`
 - Produces:
   - 启动时，生成或读取 `control.json`（secret）：`{ port, token }`。`token` 是 32 个随机字节的十六进制
   - `local` 路由：全部要求请求头 `x-fleet-token` 等于令牌，否则返回 `401`
@@ -498,11 +534,15 @@ git commit -m "docs: v1 platform capability findings"
     `FleetError` 映射为 `{ status: 400, body: { error: code, retryAfterMs? } }`（`pin-locked` 用 `423`）
   - 插件入口导出 `{ name: "dsh-fleet", inject: ["timer"], Config, apply }`
     - `Config` 为空对象 schema（设置走 `settings.json`）
-    - `apply` 同步返回，异步启动；心跳用 `ctx.setInterval`；按 Task 0 第 9 项的结论在 dispose 时调用 `stop()`
+    - `apply` 同步返回，异步启动；心跳和 Tailscale 扫描用 `ctx.setInterval`（随插件卸载自动清除）
+    - 停止逻辑写成 `ctx.effect(() => () => fleet.stop())`：关闭舰队端口、停掉发现。**不用** `ctx.on("dispose")`，cordis 4 没有这个事件（findings 第 9 项）
+    - 本计划不在 DSH Web 上注册路由；计划二、三注册时一律写成 `ctx.effect(() => ctx.webServer.register(...))`
 
-- [ ] **Step 1：写失败测试**
+- [ ] **Step 1：写失败测试**（假 ctx 的 `effect(fn)` 要模拟 cordis：立即执行 `fn`，把返回的函数收集起来，测试里调用它们来模拟卸载）
   - `local route without token gets 401; with token returns status`
   - `apply with a fake ctx starts listening and writes control.json (0600 on POSIX)`
+  - `running the collected effect disposers closes the fleet port (a new listen on it succeeds)`
+  - `apply twice on the same ctx after disposing the first does not throw`（模拟进程内重载）
   - `apply when the port is taken does not throw; status().listening.error === "EADDRINUSE"`
   - `apply with a corrupt roster.json does not throw; status().error === "roster-corrupt" and the file is unchanged`
 - [ ] **Step 2：运行，确认失败**
@@ -567,13 +607,26 @@ git commit -m "docs: v1 platform capability findings"
   - `restart B (stop + start on the same dir): same memberId, still a member, online again within 2 heartbeats`
   - `remove C from B; within 2 heartbeats A no longer lists C`
 - [ ] **Step 2：运行，确认失败或暴露缺口；如有缺口，回到对应任务修复**
-- [ ] **Step 3：运行 `npm test`，全部通过；运行 `/verify`**
-- [ ] **Step 4：在两台真实设备（Mac 桌面版 + NAS）上手工验证：建舰队、入网、心跳在线、移除。把结果记录到 findings 文档末尾**
+- [ ] **Step 3：运行 `npm test` 和 `npm run test:desktop`，全部通过；运行 `/verify`**
+- [ ] **Step 4：在两台真实设备（Mac 桌面版 + NAS）上手工验证：在 NAS 上建舰队；在 Mac 上 `dsh-fleet discover` 经 Tailscale 发现它并入网；心跳在线；移除。把结果记录到 findings 文档末尾**
+  - 安装方式（findings 意外发现 2）：DSH 里让 agent 用 `plugin_manager` 的 `install_bundle <仓库目录>`，然后重启 DSH；验证完用 `remove_bundle dsh-fleet` 换回 npm 上的 0.3.x，或者保留，由用户决定
 - [ ] **Step 5：提交** `test: v1 foundation end-to-end`
 
 ---
 
 ## 计划二、三的范围（届时另写）
+
+写计划二、三时要用上的平台结论（详见 findings）：
+
+- 会话一律走 GUI 同款服务：`ctx.inject(["sessionController", "workspaceController", "agents"], …)`。
+  - 建会话：`sessionController.create({ cwd })`；改标题：`sessionController.rename({ sessionId, title })`；
+  - 注入消息：`sessionController.prompt({ sessionId, requestId, mode: "followup", content }, signal)`。会话开着时用现成的 agent，没开时带预设恢复；
+  - 归档：`workspaceController.archiveSession({ sessionId })`。
+  - **禁止**自己调 `ctx.agents.resume`：会话开着时会抛 `SessionAlreadyOwnedError`，没开时不挂预设。
+- 回执注入后会显示为"用户消息"，正文开头要带 `【舰队回执 · 来自 <成员名>】` 一类的标识。
+- 通知只能由客户端半体发出（`new Notification()`）；PIN 弹窗用 `@deepseek-ai/dsh-client-ui-primitives` 的 `Modal`，输入框加 `data-modal-autofocus`。
+- 客户端模块只导出 `apply`；`dsh.client.inject` 只写在 `package.json` 里。
+- DSH Web 上的面板和管理路由要自己鉴权。
 
 - **计划二 · 派活与会话**：
   - `fleet_directory`、`fleet_send`、`fleet_task`、`fleet_describe_self`、`fleet_request` 五个 AI 工具；
