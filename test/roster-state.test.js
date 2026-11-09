@@ -59,7 +59,7 @@ test("a join signed by X that is an ancestor of remove(X) stays, admittedBy X", 
 	assert.equal(s.members.has(ids[1].memberId), false);
 });
 
-test("concurrent mutual removal is resolved the same way on every node", async () => {
+test("concurrent mutual removal removes both sides, identically on every node", async () => {
 	const { ids, create } = await makeFleet(3);
 	const jB = join_(ids[0], ids[1], [create.hash]);
 	const jC = join_(ids[0], ids[2], [jB.hash]);
@@ -67,9 +67,43 @@ test("concurrent mutual removal is resolved the same way on every node", async (
 	const rC = remove_(ids[1], ids[2], [jC.hash]); // B removes C, concurrently
 	const a = fold([create, jB, jC, rB, rC]);
 	const b = fold([rC, rB, jC, jB, create]);
-	assert.deepEqual([...a.members.keys()].sort(), [...b.members.keys()].sort());
-	assert.equal(a.members.size, 2, "exactly one of B and C is removed");
-	assert.equal(a.members.has(ids[0].memberId), true);
+	assert.deepEqual([...a.members.keys()], [ids[0].memberId], "removal wins on both sides (spec §5.3)");
+	assert.deepEqual([...b.members.keys()], [ids[0].memberId]);
+});
+
+test("a removed member cannot backdate a remove of its remover and take over the PIN", async () => {
+	const { ids, create } = await makeFleet(3); // A=0 creates, B=1, X=2
+	const [A, B, X] = ids;
+	const jB = join_(A, B, [create.hash]);
+	const jX = join_(A, X, [jB.hash]);
+	const chain = [];
+	let head = jX;
+	for (let i = 0; i < 6; i++) { head = describe_(A, "a", `d${i}`, [head.hash], 4000 + i); chain.push(head); } // push A's chain deep
+	const rX = remove_(A, X, [head.hash], 5000);
+	const evilRemove = remove_(X, A, [jX.hash], 4500); // X picks shallow parents to look early
+	const evilPin = pin_(X, "evil", [evilRemove.hash], 4600);
+	const all = [create, jB, jX, ...chain, rX, evilRemove, evilPin];
+	for (const order of [all, [...all].reverse()]) {
+		const s = fold(order);
+		assert.equal(s.members.has(X.memberId), false, "X stays removed");
+		assert.equal(s.members.has(B.memberId), true, "B is untouched");
+		assert.notEqual(s.pinVerifier, "evil", "X's PIN change has no effect");
+	}
+});
+
+test("a remove by a member who is concurrently being removed has no effect on a third member", async () => {
+	const { ids, create } = await makeFleet(3); // A=0, B=1, C=2
+	const [A, B, C] = ids;
+	const jB = join_(A, B, [create.hash]);
+	const jC = join_(A, C, [jB.hash]);
+	const rC = remove_(B, C, [jC.hash], 5000); // B removes C
+	const rA = remove_(C, A, [jC.hash], 5000); // C, unaware, removes A concurrently
+	for (const events of [[create, jB, jC, rC, rA], [rA, rC, jC, jB, create]]) {
+		const s = fold(events);
+		assert.equal(s.members.has(A.memberId), true, "A stays: C's remove is invalid");
+		assert.equal(s.removed.has(A.memberId), false);
+		assert.equal(s.members.has(C.memberId), false);
+	}
 });
 
 test("concurrent pin.change: later at wins; equal at → larger memberId wins; pinConflict lists the loser", async () => {
