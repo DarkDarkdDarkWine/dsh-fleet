@@ -1,120 +1,204 @@
 # dsh-fleet v1 平台能力验证结论
 
-测试环境：DSH Desktop 0.12.1 / macOS (darwin arm64) / Node v24.17.0 (Electron/BoringSSL)；NAS DSH 0.3.1 (dsh-fleet) / 飞牛 fnOS (Linux x86_64) / Node v24.14.1 (OpenSSL 3.5.5)
-测试日期：2026-11-05 起（Phase A 完成；GUI 侧实测 Phase C 待跑，下表以 ⏳ 标注）
+- **测试环境**
+  - Mac：DSH Desktop 0.12.1，核心包 `0.2.1-rc.2`，cordis 4.0.5；macOS arm64；内置 Node v24.17.0（Electron 43，BoringSSL，`process.versions.openssl === "0.0.0"`）。
+  - NAS：飞牛 fnOS，Linux x86_64；Node v24.14.1（OpenSSL 3.5.5）。
+- **测试日期**：2026-11-05 至 2026-11-08。
+- **分工**：Phase A 由 GLM 完成（第 1、2、4 项的实测，第 5、7 项的源码定位）；其余由 Claude 补测。测试用的探针 `dsh-fleet-probe` 0.3.x 已卸载。
+- **源码路径**：凡未注明的，均指 `/Applications/DSH Desktop.app/Contents/Resources/app.asar` 里的 `node_modules/@deepseek-ai/<包>/lib/index.js`。
 
 ## 总览
 
 | # | 能力 | 结论 | 证据 |
-|---|------|------|------|
-| 1 | Desktop/NAS 运行时版本 | 可行（有坑：BoringSSL） | 实测 |
-| 2 | Ed25519 证书 + mTLS | 部分：Desktop 不行，降级方案可行 | 实测 |
-| 3 | 插件自开端口 | 部分：监听✓，跨设备访问⏳ | 实测（半） |
-| 4 | mDNS 互相发现 | 不可行（用户拓扑），保留为机会性增强 | 实测 |
-| 5 | 会话管理（建/标题/归档） | 可行（API 已定位，进程内实测⏳） | 源码+实测（半） |
-| 6 | 向打开的会话注入消息 | ⏳ 探针就绪待测 | — |
-| 7 | 用户通知 | 可行（源码证实），GUI 实测⏳ | 源码 |
-| 8 | 面板模态框 | ⏳ 探针就绪待测 | 源码（组件存在） |
-| 9 | dispose 钩子 | ⏳ 待测 | — |
+|---|---|---|---|
+| 1 | 运行时版本 | 可行；Desktop 用的是 BoringSSL | 实测 |
+| 2 | Ed25519 证书 + 双向 TLS | Desktop 上**不可行**；P-256 可行 | 实测（独立进程 + DSH 进程内） |
+| 3 | 插件自开端口 | 可行（`0.0.0.0` 监听，跨设备经 Tailscale 可达） | 实测（DSH 进程内 + NAS curl） |
+| 4 | mDNS 互相发现 | 在用户的网络拓扑下不可行，只能作为同网段的补充 | 实测 |
+| 5 | 会话：新建 / 标题 / 归档 | 可行（`sessionController` + `workspaceController`） | 实测（DSH 进程内 + GUI 确认） |
+| 6 | 向会话注入消息并唤醒 agent | 可行，但**必须走 `sessionController.prompt`** | 实测三种情况 + 源码 |
+| 7 | 用户通知 | 可行（客户端 `new Notification()` → macOS 原生通知） | 实测（GUI 确认）+ 源码 |
+| 8 | 面板模态框 | 可行（`dsh-client-ui-primitives` 的 `Modal`） | 实测（GUI 确认）+ 源码 |
+| 9 | 卸载 / 重载时的清理 | 可行，但只能用 `ctx.effect`；**cordis 4 没有 `dispose` 事件**，webServer 路由不会自动撤销 | 实测 + 源码 |
 
 ## 1. 运行时版本
 
-**结论：** 可行，但 Desktop 的 Node 是 Electron 带 BoringSSL，与官方 Node（OpenSSL）在 TLS 能力上有实质差异（见第 2 项）。
-**证据：**
-【实测】
-- DSH Desktop 0.12.1（`/Applications/DSH Desktop.app`，CFBundleExecutable="DSH Desktop"）
-- Desktop 内置 Node：`v24.17.0 darwin arm64`，`execPath=.../DSH Desktop Helper.app/Contents/MacOS/DSH Desktop Helper`；`process.versions.openssl === "0.0.0"`（BoringSSL 特征）
-- `ELECTRON_RUN_AS_NODE=1 "/Applications/DSH Desktop.app/Contents/MacOS/DSH Desktop" script.mjs` 可直接跑脚本
-- harness shell 里的 `node` = Desktop 自带 `…/harness/.desktop-bin/node`（同 BoringSSL 后端）——**写测试脚本时要小心，`node` 不等于官方 node**
-- 官方 OpenSSL Node 在 `~/.nvm/versions/node/v24.20.0`（OpenSSL 3.5.7）
-- NAS：Node `v24.14.1`，OpenSSL 3.5.5
-【源码】asar 内核心包全部 `0.2.1-rc.2`，cordis 4.0.5
-**对计划二、三的影响：** 插件代码若依赖 `node:crypto` 的 X509/Ed25519 TLS 行为，必须考虑 BoringSSL 差异；不要假设 `openssl` 语义。
-**替代方案：** 不需要。
+**结论：** 可行。Desktop 内置的 Node 是 Electron 的 BoringSSL 版，TLS 能力和官方 Node（OpenSSL）不一样（见第 2 项）。
 
-## 2. Ed25519 证书 + 双向 TLS
+**证据【实测】**
 
-**结论：** Desktop（BoringSSL）上 Ed25519 mTLS **握手失败**，ECDSA P-256 mTLS 可行 → 采用计划 Task 0 Step 2 的降级方案：**ECDSA P-256 做 TLS，Ed25519 只做签名背书**。官方 Node 与 NAS 上 Ed25519 mTLS 均可行。
-**证据：**
-【实测】矩阵（探针 `/tmp/fleet-probe-tls/mtls-probe.mjs`，@peculiar/x509 3.1.0 + reflect-metadata，node:https + requestCert:true/rejectUnauthorized:false）：
+- DSH 进程：`node=v24.17.0 platform=darwin arch=arm64`，`execPath=…/DSH Desktop Helper.app/…`（`harness.log` 启动行）。
+- 运行脚本：`ELECTRON_RUN_AS_NODE=1 "/Applications/DSH Desktop.app/Contents/MacOS/DSH Desktop" x.mjs` 可以直接跑脚本，和 DSH 进程是同一套运行时。
+- PATH 陷阱：harness shell 里的 `node` 是 `…/harness/.desktop-bin/node`，同样是 BoringSSL；官方 Node 在 `~/.nvm/versions/node/v24.20.0`。
 
-| 运行时 | SSL 后端 | Ed25519 mTLS | ECDSA P-256 mTLS |
-|---|---|---|---|
-| Electron-as-node v24.17.0 | BoringSSL | ✗ `SSLV3_ALERT_HANDSHAKE_FAILURE` (alert 40) | ✓ |
-| .desktop-bin/node v24.17.0 | BoringSSL | ✗ 同上 | （同后端，未重复测） |
-| nvm v24.20.0 | OpenSSL 3.5.7 | ✓ | ✓ |
-| NAS v24.14.1 | OpenSSL 3.5.5 | ✓ | ✓ |
+**对计划的影响：** 测试必须在两个运行时上都跑（官方 Node 和 Desktop 运行时）。
 
-服务端 `getPeerCertificate()` 可拿对端 CN/fingerprint256（ECDSA 路径验证过）；客户端可拿服务端证书。
-探针 v0.1.0 已在真实 harness 内做过 ECDSA mTLS 自测（fleet-probe-report.json，事故前落盘成功）。
-【实测】@peculiar/x509 v3 API 要点（踩坑记录）：
-- 必须 `import "reflect-metadata"`（tsyringe 依赖），否则运行时报错
-- `await X509CertificateGenerator.createSelfSigned({ name, notBefore, notAfter, keys, signingAlgorithm })`——**单参数对象、async**
-- node `KeyObject` 需 `export({format:"der"})` → `crypto.subtle.importKey(..., extractable: **true**)`（x509 内部要 re-export，false 报 `InvalidAccessException key is not extractable`）
-- TLS 层直接用 node:crypto 原生 PEM 交给 node:https，不经过 x509
-**对计划二、三的影响：** Task 2 的身份层接口要按「ECDSA P-256 TLS + Ed25519 背书」设计；Ed25519 不能进 TLS 握手路径（Desktop 端）。
-**替代方案：** 即降级方案本身。
+## 2. Ed25519 证书与双向 TLS
+
+**结论：** Desktop 上用 Ed25519 证书做 TLS 握手失败，P-256 证书可以。Ed25519 和 P-256 的签名、验签，以及 scrypt，在 Desktop 运行时上都正常。
+
+**证据【实测】**
+
+- **GLM 矩阵（预生成证书）**
+
+  | 运行时 | Ed25519 mTLS | P-256 mTLS |
+  |---|---|---|
+  | Electron v24.17.0（BoringSSL） | ✗ `SSLV3_ALERT_HANDSHAKE_FAILURE` | ✓ |
+  | 官方 Node v24.20.0（OpenSSL 3.5.7） | ✓ | ✓ |
+  | NAS v24.14.1（OpenSSL 3.5.5） | ✓ | ✓ |
+
+- **运行时现生成证书（探针 0.3.x，DSH 进程内）**：用 `@peculiar/x509` 3.1.0 现生成证书。Ed25519 自连报 `SSLV3_ALERT_HANDSHAKE_FAILURE`；P-256 自连成功，服务端能拿到对端的 CN 和 `fingerprint256`。
+- **签名与 scrypt（Electron 运行时）**
+  - `crypto.sign`/`verify`：Ed25519 和 P-256 都正常，篡改过的签名会被拒绝；
+  - SPKI 导出后能重新导入；
+  - `scryptSync(N=16384, r=8, p=1)` 正常。
+- **`@peculiar/x509` 的使用要点**
+  - 必须先 `import "reflect-metadata"`，再导入 x509，否则会报 `tsyringe requires a reflect polyfill`。
+  - 依赖要同时声明它的 peer：`@peculiar/asn1-schema` ^3 和 `asn1js` ^4。不声明的话，DSH 用 pnpm 安装时会报缺少 peer。
+  - 用法：`await X509CertificateGenerator.createSelfSigned({...})`，签名算法传 `{ name: "ECDSA", hash: "SHA-256" }`。
+  - Node 的 `KeyObject` 导入 WebCrypto 时，`extractable` 必须为 `true`。
+
+**对计划的影响：** 设备身份只用一把 P-256 密钥，签名和 TLS 证书都用它，不需要再用 Ed25519 做背书。成员编码 = 这把公钥 SPKI 的 sha256。
 
 ## 3. 插件自开端口
 
-**结论：** 部分。harness 进程内 `listen(43190, "0.0.0.0")` 成功（探针 v0.1.0 在事故启动的 report 里证实）；跨设备访问与 macOS 防火墙弹窗观察 ⏳（Phase C，需探针 v0.2.0 装回正常模式后从 NAS curl）。
-**证据：**【实测】事故启动时探针 init 完整跑通：43190 裸 HTTP + 43191 ECDSA mTLS 均已监听并完成进程内自测。
-**对计划二、三的影响：** v1 设计的「独立端口 + 0.0.0.0」方向初步成立，待跨设备验证闭环。
-**替代方案：** —
+**结论：** 可行。
+
+**证据【实测】**
+
+- DSH 进程内的探针 `listen(43190, "0.0.0.0")` 和 `listen(43191, "0.0.0.0")`（P-256 mTLS）都成功。
+- 从 NAS 经 Tailscale：
+  - `curl http://100.114.210.24:43190/` 返回 `{"ok":true,…,"from":"100.85.254.124"}`；
+  - `curl -k https://…:43191/` 握手成功；
+  - 带 NAS 上生成的 P-256 客户端证书访问时，服务端拿到 `peerCN=nas-client` 和对端指纹。
+- macOS 防火墙：本机的应用防火墙是关着的（`socketfilterfw --getglobalstate` → disabled），所以没有观察到"允许传入连接"的弹窗。开着防火墙时会不会弹窗，**未测**，计划三的防火墙文档要按"可能弹窗"来写。
+
+**对计划的影响：** 自开端口的方向成立。
 
 ## 4. mDNS 互相发现
 
-**结论：** 不可行（作为主路径）。用户拓扑：Mac=192.168.0.250/24，NAS 物理=enp2s0 192.168.31.14/24（另有 docker 桥 192.168.0.1/20），**互 ping 不通，全靠 Tailscale**。mDNS 不过路由器，也不穿 Tailscale。
-**证据：**
-【实测】bonjour-service ^1.4.4：
-- macOS：`publish` ✓（系统 `dns-sd -B` 能看到）；同机 `find` ✗（看不到同机系统注册的服务）
-- NAS (Linux/avahi)：publish + find 双 ✓
-- NAS browse 返回的 `addresses` 混入全部 docker 桥接口（几十个地址）——发现层必须过滤
-**对计划二、三的影响：** 发现层降级为「同 L2 机会性增强」；主路径 = PIN 入网 / 显式添加（设计文档 §5.2 的判断成立）。
-**替代方案：** Tailscale 已是事实上的成员目录来源之一（可直接枚举 tailnet 设备作为候选列表）。
+**结论：** 在用户的网络里不可行，只能作为同一网段下的补充。
 
-## 5. 会话管理（spec §8.1）
+**证据【实测，GLM】**
 
-**结论：** 可行（API 已定位，零 token 调用方式已写入探针 v0.2.0，进程内执行 ⏳）。
-**证据：**
-【源码】
-- 标题：`dsh-session-title` 提供 `sessionTitle` 服务（`super(ctx,"sessionTitle")`，`static inject=["sessions","sessionProjections"]`）：`titles.rename(agent.session, title)` → `{title,eventSeq}`；非法标题抛 `SessionTitleInvalidError`。RPC 入口：`dsh-api-session-controller/lib/index.js:3160` `name:"rename"`。
-- 归档：`workspaceRegistry.archiveSession(sessionId,{stopActivity})` / `unarchiveSession`（`dsh-api-workspace-controller/lib/index.js:297-317`，RPC `name:"archiveSession"/"unarchiveSession"`）。
-- 归档后的会话拒绝后续投递（archived-session-gate，`dsh-api-session-controller/lib/index.js:2847+`）。
-- 新建：`ctx.agents.create({sessionId, meta, agentOptions, setup})`（v0.3 已在产品里用过，会话出现在 GUI 列表）。
-【实测】探针 v0.2.0 内置标题/归档零 token 测试（待正常模式运行）。
-**对计划二、三的影响：** 派活会话（per-task session）+ 标题 + 归档全链路可按现有 API 实现，无需绕路。
+- Mac 在 `192.168.0.250/24`，NAS 的物理网口在 `192.168.31.14/24`，两边在局域网里互相 ping 不通，只能走 Tailscale。mDNS 不过路由器，也不穿 Tailscale。
+- `bonjour-service` ^1.4.4：
+  - macOS 上 `publish` 正常（系统 `dns-sd -B` 能看到）；
+  - NAS（avahi）上 `publish` 和 `find` 都正常；
+  - NAS 广播出的地址里混着几十个 docker 网桥地址，其中 `192.168.0.1/20` 还覆盖了 Mac 所在的网段。
 
-## 6. 向打开着的会话注入消息（spec §8.2）
+**对计划的影响：**
 
-**结论：** ⏳ 待测。探针 v0.2.0 已带 `/probe/inject`（POST → 向最近活跃会话 `agents.resume` + `followup`），需正常模式装回后在 GUI 打开会话的场景 a/b/c 各测一次。
-**对计划二、三的影响：** 待定。
+- 主路径是 PIN 入网。
+- 地址枚举必须过滤 docker/虚拟网卡（`docker*`、`br-*`、`veth*`、`virbr*`）和链路本地地址。
+- Tailscale 是否作为第二个发现来源，**待用户决定**。
 
-## 7. 用户通知（spec §8.3）
+## 5. 会话：新建 / 标题 / 归档
 
-**结论：** 可行（源码层已证实，GUI 实测⏳）。**客户端半体直接用标准 Web `Notification` API 即可得到原生 macOS 通知**——preload 已把 `window.Notification` 整个替换为 DesktopNotification 类。
-**证据：**
-【源码】`app.asar/out/preload/index.cjs:155-240`：`new Notification(title,{body,tag,icon,data,silent})` → IPC `dsh:notification-show` → 原生通知；`permission='granted'`（静态）；`onclick` 可用（点击 focus 窗口）。宿主半体无专门通知服务（桌面主进程 `desktop-main.js:19331` `registerDesktopNotificationBridge`）。
-**对计划二、三的影响：** 面板通知走 Web Notification API；宿主侧（管家回执提醒）需经客户端半体转发或走 toast。
-**替代方案：** 应用内 toast（见第 8 项组件）。
+**结论：** 可行。用的是 GUI 背后同一套服务，从进程内调用，不经过 RPC。
 
-## 8. 面板模态框（spec §8.5）
+**证据【实测，探针 0.3.0】**
 
-**结论：** ⏳ 待测。源码层：`@deepseek-ai/dsh-client-ui-primitives` 导出 `Toast, Modal, useModalLayer, isBehindModal, closeTopModal, modalSelector` 等（完整清单 `/tmp/asar-extracts/ui-primitives-index.js`）。动态插件能否 require 该包、portal 到 body、键盘焦点，待探针 v0.2.0 三按钮面板实测。
+- 通过 `ctx.inject(["sessionController","workspaceController","agents"], …)` 拿到三个服务（`apply` 时同步 `ctx.get` 拿不到，必须用 `inject` 等它们就绪）。
+- `sessionController.create({ cwd })` → `{ sessionId: "session-c7ceb4c0-…", agentPreset: "standard" }`：会话自动挂上默认预设，并出现在 GUI 列表里（用户确认）。
+- `sessionController.rename({ sessionId, title })` → `{ title: "舰队探针测试会话", seq: 3 }`，GUI 显示新标题（用户确认）。
+- `workspaceController.archiveSession({ sessionId })` / `unarchiveSession({ sessionId })` 都成功。归档后的会话会拒绝新消息（源码：`dsh-api-session-controller` 的 archived-session gate）。
 
-## 9. dispose 钩子
+**【源码】**
 
-**结论：** ⏳ 待测（探针 v0.2.0 关服逻辑已就绪，测重载/退出三种情形）。
-【源码】`dsh-agent-loop/lib/index.js:1418-1467`：`FactoryOwnership.liveAgents` Set；`handle.dispose()` → abort 该 agent 的 initiator scope（"agent initiator scope is disposed"）并移出 liveAgents；已落盘事件保留。
+- `dsh-api-session-controller`：`class … super(ctx, "sessionController")` 对外提供 `create`/`rename`/`prompt`/`cancel`/`delete`/`fork`，这些就是 GUI 调用的 RPC 方法本身。
+- 进程内调用时 `ctx.invocation` 为空，`principalOf` 会把调用者当作 owner（受信任的进程内代码）。
+
+**对计划的影响：** 计划二"每件事一个会话"直接用 `create` → `rename` → 处理 → `archiveSession`。
+
+## 6. 向会话注入消息并唤醒 agent
+
+**结论：** 可行，但必须走 `sessionController.prompt(request, signal)`，**不能**自己调 `ctx.agents.resume`。
+
+**证据【实测，探针 0.3.x，探针自建的测试会话】**
+
+| 情况 | 调用前状态 | 结果 |
+|---|---|---|
+| a. agent 活着且空闲 | `live:true, idle` | `{accepted:true}`，立刻开始新一轮，回复"收到A" |
+| b. agent 正在回答（数到 60） | `live:true, running` | `{accepted:true}`，消息排进下一轮；第一轮结束后接着回复"收到B2"，顺序不乱 |
+| c. 没有活着的 agent（DSH 重启后） | `live:false` | `{accepted:true}`，控制器带着预设恢复会话，回复"收到C" |
+
+- 请求格式：`{ sessionId, requestId: randomUUID(), mode: "followup" | "steer", content: [{ type: "text", text }] }`。
+- 用户在 GUI 打开测试会话后，能看到全部注入的消息和回复（用户确认）。
+- 消息在会话里记作 `source.kind = "user"`，显示为一条用户消息。
+
+**反例【实测，GLM 的探针 0.2.0】**
+
+- 直接 `ctx.agents.resume({ resumeSessionId })` 加 `followup`：没打开的会话不挂预设，那一轮报错 `prompt variable "{{model}}" has no value … (section "deployment:persona-prefix")`。
+- 如果 GUI 已经打开着这个会话，持久层只允许一个写入者，会抛 `SessionAlreadyOwnedError`（源码：`dsh-session-persistence-jsonl` 的 `writers`）。
+- 注入后 `handle.dispose()` 还会中止 agent 正在进行的那一轮。
+
+**【源码】** `SessionCommands.resolve()`：先 `ctx.agents.get(id)` 找已经活着的 agent，找不到才 `resume`，并带上 `presets.mount` 的预设。GUI 发消息走的就是这条路。
+
+**对计划的影响：**
+
+- 回执注入原对话、派活给每件事的会话，都统一用 `prompt`。
+- 回执会显示为"用户消息"，正文开头要带明确的标识，例如 `【舰队回执 · 来自 nas】`。
+
+## 7. 用户通知
+
+**结论：** 可行。
+
+**证据**
+
+- 【实测】面板里调用 `new Notification("舰队探针", { body, tag })`，弹出了 macOS 原生通知（用户确认），`Notification.permission === "granted"`。
+- 【源码，GLM】`app.asar/out/preload/index.cjs:155-240`：preload 把 `window.Notification` 换成了桥接类，点击通知会把 DSH 窗口切到前台。
+
+宿主半体没有可用的通知服务，提醒要从客户端半体发出。
+
+**对计划的影响：** 由面板（客户端半体）订阅事件并发出通知；宿主半体只负责提供事件。
+
+## 8. 面板模态框
+
+**结论：** 可行。
+
+**证据**
+
+- 【实测】面板能 `require("@deepseek-ai/dsh-client-ui-primitives")` 拿到 `Modal` 和 `Toast`。渲染 `Modal` 后，对话框盖住整个窗口，带 `data-modal-autofocus` 的输入框自动拿到焦点，按 Esc 能关闭；`Toast` 能正常显示（用户确认）。
+- 【源码】
+  - `Modal({ open, onClose, title, closeLabel, description, children, footer, headless })` 会通过 `createPortal` 挂到 `document.body`，并用 `useModalLayer` 管理焦点和 Esc。
+  - `Toast({ text, icon, tone, anchor, holdMs, actions, onDone })` 是要渲染出来的组件，不是函数调用。
+- 【实测，GLM 事故】客户端模块**只能导出 `apply`**。如果导出了 `inject: ["@deepseek-ai/dsh-client-ui-slots"]`，cordis 会把它当成必需的服务名，模块永远等不到激活，Desktop 就会进安全模式。包名只能写在 `package.json` 的 `dsh.client.inject` 里。
+
+**对计划的影响：** 计划三的 PIN 弹窗直接用 `Modal`。
+
+## 9. 卸载 / 重载时的清理
+
+**结论：**
+
+- cordis 4 **没有 `dispose` 事件**，`ctx.on("dispose")` 永远不会触发。清理只能写成 `ctx.effect(() => () => cleanup())`。
+- `ctx.effect` 的回调会**立刻执行**，返回的函数才是清理函数。
+- webServer 路由不会随插件卸载自动撤销，必须手动撤。
+
+**证据【实测，探针 0.3.x 的生命周期日志】**
+
+- **DSH 退出**：每次退出前都有一条 `dispose: closing 2 server(s)`，重启后重新监听没有报端口被占用（共 5 次）。
+- **进程内重载**：同一个 pid 86043 先 `dispose`、再 `apply`（插件被替换时）。
+- **卸载**（`remove_bundle`）：同一个 pid 98122 执行了 `dispose`，之后 43190 和 43191 都不再监听（`lsof` 为空）。但 `/probe/report` 路由**在卸载后仍然能访问**，直到下次重启。
+
+**证据【源码】**
+
+- `cordis` 的 `Fiber.effect(execute)`：`execute` 立刻执行，返回值作为清理函数；整个包里没有 `dispose` 事件。
+- `dsh-host-webserver` 的 `register(route)`：返回一个撤销函数，但没有挂到 fiber 上；同一条路由再次注册会抛 `duplicate exact route`。
+
+**对计划的影响（Task 10）：**
+
+- 每一处 `webServer.register`、`tools.register` 和定时器都要放进 `ctx.effect(() => register(...))`，让撤销函数随插件卸载执行；
+- 自开端口的关闭也放进 `ctx.effect`；
+- 不使用 `ctx.on("dispose")`。
 
 ## 意外发现
 
-1. **客户端半体导出铁律**：`lib/client.js` 只能导出 `apply`。探针 v0.1.0 曾导出 `inject: ["@deepseek-ai/dsh-client-ui-slots"]`，cordis client runner 把它当必需服务名 → "waiting for activation" → 桌面进安全模式。产品 0.3.x 的写法（只导出 apply，inject 只写在 package.json `dsh.client.inject`）是唯一正确范式。（实测+用户侧复现）
-2. **桌面修复流程会自动清掉手动停用条目**：安全模式修复期间写进 `cordis.patch.yml` 的 `disabled: true` 与 market state 的 disabled 会被开机修复清掉，导致"停用后重启仍失败"。彻底修复必须改插件包本身或完整卸载。（实测）
-3. **Electron Node 与官方 Node 的 `node` 命令重名陷阱**：harness shell PATH 里 `.desktop-bin/node` 在前，测试脚本若要 OpenSSL 行为必须显式用 nvm 路径。
-4. **tar 跨机传输**：macOS→Linux `tar czf` 会刷大量 `LIBARCHIVE.xattr.com.apple.provenance` 警告（无害）；用 `COPYFILE_DISABLE=1 tar` 或 rsync 消除。
-5. **探针包安装要求**（实测）：package.json 必须声明 `dsh.bundle.patch` 与 `exports["."]`，否则报 `not-bundle` / `ERR_PACKAGE_PATH_NOT_EXPORTED`。
-6. **插件可携带 npm 依赖**：探针 v0.2.0 带 `@peculiar/x509 + reflect-metadata` dependencies 走 generation 安装（staging pnpm 会装好），v1 的身份层可以直接这么用（⏳ 安装验证）。
-
----
-*Phase C（项 3/6/7/8/9 的 GUI 侧与跨设备实测）待桌面恢复正常模式后继续；本文档随测随更。*
+1. **DSH 不替插件的 Web 路由做鉴权**：探针的 `/probe/*` 不带任何令牌就能访问，所以 v1 面板和管理路由必须自己做鉴权。
+2. **插件安装方式**：
+   - DSH agent 的 `plugin_manager` 工具 `install_bundle <本地目录>` 会生成一份新的安装，DSH **重启后才生效**；
+   - `remove_bundle` 会把插件从 `package.json` 里去掉，并在当前进程里立刻卸载它，残留的安装文件下次启动时被清理；
+   - 包必须声明 `dsh.bundle.patch` 和 `exports["."]`（GLM 实测）。
+3. **桌面修复流程会清掉手动停用的条目**：安全模式修复时，写进 `cordis.patch.yml` 的 `disabled: true` 会被开机修复清掉。要彻底修好，只能改插件包本身或完整卸载（GLM 实测）。
+4. **探针事故的副作用**：GLM 的探针 0.2.0 往用户会话 `session-7ec7aff5…`、`session-e4e490cf…` 和 `fleet-steward-mac-gui` 里各注入了一条测试消息，那几轮都失败了。测试会话"舰队探针测试会话"（`session-c7ceb4c0…`）留给用户自行删除。
+5. **tar 跨机传输**：macOS → Linux 用 `tar czf` 会刷出大量 xattr 警告，无害；用 `COPYFILE_DISABLE=1` 可以消除（GLM 实测）。
