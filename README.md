@@ -1,5 +1,10 @@
 # dsh-fleet
 
+> **v1 开发中**：当前 `main` 是 v1 alpha（`1.0.0-alpha.1`），协议与 v0.3 不兼容，**生产请用 npm 上的 0.3.x**。
+> v1 计划一（基础层）已完成：设备身份（P-256）、签名名册、PIN 建舰队与入网、双向 TLS 自有端口（默认 43190）、心跳与地址自动更新、mDNS 与 Tailscale 发现、移除成员、改/重置 PIN，以及配套 CLI（`dsh-fleet status | discover | create | join | members | remove | pin change | pin reset | describe | leave`）。派活、会话、AI 工具和面板在计划二、三。
+> 设计：`docs/superpowers/specs/2026-11-05-dsh-fleet-v1-design.md`；平台结论：`docs/superpowers/specs/2026-11-05-dsh-fleet-v1-platform-findings.md`。
+> 下文描述的是 v0.3。
+
 DeepSeek Harness 多设备舰队插件：每台设备常驻一个「管家」agent 会话，设备间经内网（tailscale）互发消息、心跳互探，任意 agent 可指挥任意 agent。
 
 ## 能力
