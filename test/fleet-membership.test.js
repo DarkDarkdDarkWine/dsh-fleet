@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHeartbeat } from "../lib/heartbeat.js";
 import { FleetError } from "../lib/fleet.js";
+import { requestMember } from "../lib/transport/client.js";
 import { PIN, startFleet, startNode } from "./helpers/net.js";
 
 const isCode = (code) => (err) => err instanceof FleetError && err.code === code;
@@ -154,5 +155,46 @@ test("one tick against an unreachable member stays within heartbeatSec / 2", asy
 		const started = Date.now();
 		await tick(b);
 		assert.ok(Date.now() - started < (b.fleet.settings.heartbeatSec * 1000) / 2);
+	} finally { await f.stop(); }
+});
+
+test("a peer with a corrupt file answers 503 and does not mark others rejected", async () => {
+	const f = await startFleet(["a", "b"]);
+	const [a, b] = f.nodes;
+	try {
+		await tick(a, b);
+		b.fleet.error = "roster-corrupt"; // as if B started with a damaged roster.json
+		const r = await requestMember({ identity: a.fleet.identity, addresses: [b.address()], expectMemberId: b.fleet.identity.memberId, method: "POST", path: "/v1/heartbeat", body: a.fleet.heartbeatPayload() });
+		assert.equal(r.status, 503);
+		await tick(a);
+		assert.equal(a.fleet.status().self.rejected, false);
+	} finally { await f.stop(); }
+});
+
+test("a new member that reaches B before B has synced its join is not marked rejected", async () => {
+	const f = await startFleet(["a", "b"]);
+	const [a, b] = f.nodes;
+	const c = await startNode("c");
+	try {
+		await tick(a, b);
+		await c.fleet.join({ address: a.address(), pin: PIN, memberName: "c" });
+		c.fleet.book.record(b.fleet.identity.memberId, b.address(), true); // e.g. learnt from a Tailscale scan
+		await tick(c);
+		assert.equal(c.fleet.status().self.rejected, false, "B simply does not know C yet");
+		await tick(a, c);
+		assert.equal(member(b, "c").online, true);
+		assert.equal(c.fleet.status().self.rejected, false);
+	} finally { await Promise.all([f.stop(), c.stop()]); }
+});
+
+test("the rejected flag clears on the next successful heartbeat", async () => {
+	const f = await startFleet(["a", "b"]);
+	const [a, b] = f.nodes;
+	try {
+		await tick(a, b);
+		b.fleet.markRejected();
+		assert.equal(b.fleet.status().self.rejected, true);
+		await tick(b);
+		assert.equal(b.fleet.status().self.rejected, false);
 	} finally { await f.stop(); }
 });
