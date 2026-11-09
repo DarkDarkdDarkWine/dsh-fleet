@@ -34,6 +34,7 @@ const MESSAGES = {
 	unreachable: "连不上对方",
 	"roster-corrupt": "roster.json 已损坏，舰队已停用；请修复或删除该文件后重启 DSH",
 	"state-corrupt": "state.json 已损坏，舰队已停用；请修复或删除该文件后重启 DSH",
+	"identity-corrupt": "identity.json 已损坏，舰队已停用；请从备份恢复该文件后重启 DSH（删除它会得到新身份，需要重新入网）",
 	removed: "本机这个身份已被移出舰队；要重新加入，先运行 dsh-fleet leave 换一个新身份",
 	"rate-limited": "请求太频繁，请稍后再试",
 	"self-remove": "不能移除本机自己",

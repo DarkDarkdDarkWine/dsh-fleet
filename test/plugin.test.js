@@ -107,3 +107,18 @@ test("a locked PIN maps to 423 with retryAfterMs on the local routes", async () 
 		assert.ok(r.body.retryAfterMs > 0);
 	} finally { await ctx.dispose(); }
 });
+
+test("apply with a corrupt identity.json does not throw; status().error === \"identity-corrupt\" and the file is unchanged", async () => {
+	const dir = dataDir();
+	writeFileSync(join(dir, "identity.json"), "{}");
+	const { ctx } = await run(dir);
+	try {
+		const r = await callLocal({ dataDir: dir, path: "/local/status" });
+		assert.equal(r.status, 200);
+		assert.equal(r.body.error, "identity-corrupt");
+		assert.equal(r.body.joined, false);
+		const create = await callLocal({ dataDir: dir, method: "POST", path: "/local/create", body: { name: "家", pin: "246810" } });
+		assert.deepEqual([create.status, create.body.error], [400, "identity-corrupt"]);
+		assert.equal(readFileSync(join(dir, "identity.json"), "utf8"), "{}");
+	} finally { await ctx.dispose(); }
+});
